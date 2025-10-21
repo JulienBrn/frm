@@ -1,6 +1,6 @@
 import anyio.to_thread
 # from dafn.dask_helper import checkpoint_xra_zarr, checkpoint_xrds_zarr, checkpoint_delayed
-from pipeline_fct.rats import get_matfile_metadata, get_smrx_metadata, get_initial_signals, rat_raw_chan_classification
+from pipeline_fct.rats import get_matfile_metadata, get_smrx_metadata, rat_raw_chan_classification, get_mat_df, mat_spike2_raw_join, extract_timing
 from dafn.signal_processing import compute_psd_from_scaled_fft, compute_coh_from_psd, compute_welch_from_psd
 from dafn.signal_processing import compute_bua, compute_lfp, compute_scaled_fft
 from dafn.spike2 import smrxadc2electrophy, smrxchanneldata
@@ -12,8 +12,9 @@ import re, shutil
 import dask, dask.array as da
 import anyio
 import logging
+import h5py
 # import beautifullogger
-from pipeline_helper import checkpoint_xarray
+from pipeline_helper import checkpoint_xarray, checkpoint_json
 
 logger = logging.getLogger(__name__)
 # beautifullogger.setup()
@@ -43,8 +44,11 @@ def get_session_info():
     analysis_ds["spike2_file"] = analysis_ds["session"]
     analysis_ds["session"] = xr.apply_ufunc(lambda p: str(Path(p).with_suffix("")).replace("/", "--"), analysis_ds["spike2_file"], vectorize=True)
     analysis_ds["spike2_file"] = str(spike2files_basefolder) + "/"+ analysis_ds["spike2_file"].astype(str)
-    analysis_ds["mat_file"] = xr.where(analysis_ds["mat_file"].notnull(), str(mat_basefolder) + "/"+ analysis_ds["mat_file"].astype(str), np.nan)
+    analysis_ds["mat_file"] = xr.where(analysis_ds["mat_file"].notnull(), analysis_ds["mat_file"].astype(str), np.nan)
     return analysis_ds
+
+
+
 
 
 async def process_rat_session(session_ds, session_index):
@@ -52,9 +56,18 @@ async def process_rat_session(session_ds, session_index):
     spike2_file = session_ds["spike2_file"].item()
     all_chans = smrxchanneldata(spike2_file)
     all_raw_chans = all_chans.loc[all_chans["physical_channel"]>= 0].copy()
+    mat_df = get_mat_df(session_ds["mat_file"], mat_basefolder)
+    all_raw_chans = all_raw_chans.merge(mat_spike2_raw_join(mat_df, all_raw_chans), on=all_raw_chans.columns.tolist(), how="left")
+    if pd.isna(all_raw_chans["mat_key"]).all():
+        return 
+    start_t, end_t = (await checkpoint_json(lambda: extract_timing(all_raw_chans, spike2_file, mat_basefolder),
+                                           f"timing/{session_str}.json", "timing", session_index))()
+
     all_raw_chans["chan_group"] = all_raw_chans["chan_name"].str.lower().apply(rat_raw_chan_classification)
     probe_chan_nums = all_raw_chans["chan_num"].loc[all_raw_chans["chan_group"]=="Probe"].tolist()
     ipsieeg_chan_nums = all_raw_chans["chan_num"].loc[all_raw_chans["chan_group"]=="EEGIpsi"].tolist()
+    
+
     initial_sigs = {}
     if len(probe_chan_nums) > 0:
          initial_sigs["lfp"] = lambda: compute_lfp(smrxadc2electrophy(spike2_file, probe_chan_nums))
@@ -67,7 +80,7 @@ async def process_rat_session(session_ds, session_index):
 
     async def process_sig(func, n):
         sig = await checkpoint_xarray(func, f"{n}/{session_str}.zarr", n, session_index)
-        fft = await checkpoint_xarray(lambda: compute_scaled_fft(sig()).sel(f=slice(None, 120)), f"fft_{n}/{session_str}.zarr", f"fft_{n}", session_index)
+        fft = await checkpoint_xarray(lambda: compute_scaled_fft(sig().sel(t=slice(start_t, end_t))).sel(f=slice(None, 120)), f"fft_{n}/{session_str}.zarr", f"fft_{n}", session_index)
         psd = await checkpoint_xarray(lambda: compute_psd_from_scaled_fft(fft()), f"psd_{n}/{session_str}.zarr", f"psd_{n}", session_index)
         welch = await checkpoint_xarray(lambda: compute_welch_from_psd(psd()), f"welch_{n}/{session_str}.zarr", f"welch_{n}", session_index)
         coh = await checkpoint_xarray(lambda: compute_coh_from_psd(psd()), f"coh_{n}/{session_str}.zarr", f"coh_{n}", session_index)
@@ -110,6 +123,7 @@ async def process_sessions(analysis_ds: xr.Dataset):
         for s in range(analysis_ds.sizes["session"]):
             ds = analysis_ds.isel(session=s)
             tg.start_soon(add_session_result, ds, s)
+            await anyio.sleep(0)
             # await anyio.sleep(1)
 
     # all_welch = await checkpoint_xra_zarr(xr.concat(welchs, dim="channel"), base_result_path/f"all_welch.zarr", client)

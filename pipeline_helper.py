@@ -3,7 +3,7 @@ import tqdm.auto as tqdm
 import xarray as xr
 import dask.array as da
 import anyio, shutil
-import heapq
+import heapq, json
 from contextlib import asynccontextmanager
 
 class Limiter:
@@ -124,6 +124,43 @@ async def checkpoint_xarray(func, path: Path, group: str, priority: float):
         groups[group][1]+=1
         bar.set_postfix(dict(prev_done=groups[group][1], computing=groups[group][2]))
     return lambda : _load(path)
+
+async def checkpoint_json(func, path: Path, group: str, priority: float):
+    id = str(path)
+    path = base_result_path/path
+    #No need for thread safety, this should always be called from the main thread
+    if not group in groups:
+        groups[group] = [tqdm.tqdm(desc=group, total=0), 0, 0]
+    bar = groups[group][0]
+    if not path.exists():
+        bar.total+=1
+        bar.refresh()
+        tmp_path = path.with_name(".tmp"+path.name)
+        #Its fine if the tmp file lingers, it can be used for bug inspection
+        async with my_limiter.get(priority):
+            groups[group][2]+=1
+            bar.set_postfix(dict(prev_done=groups[group][1], computing=groups[group][2]))
+            def mrun():
+                res = func()
+                tmp_path.parent.mkdir(exist_ok=True, parents=True)
+                with tmp_path.open("w") as f:
+                    json.dump(res, f)
+            try:
+                await anyio.to_thread.run_sync(mrun)
+            except Exception as e:
+                raise add_note_to_exception(e, f"While computing {id}")
+            finally:
+                groups[group][2]-=1
+                bar.set_postfix(dict(prev_done=groups[group][1], computing=groups[group][2]))
+        shutil.move(tmp_path, path)
+        bar.update(1)
+    else:
+        groups[group][1]+=1
+        bar.set_postfix(dict(prev_done=groups[group][1], computing=groups[group][2]))
+    def load():
+        with path.open("r") as f:
+            return json.load(f)
+    return load
 
 
         
