@@ -177,6 +177,7 @@ def extract_timing(joined_df: pd.DataFrame, spike2_file, mat_basefolder):
             key = row["mat_key"]
             file = row["mat_path"]
             chan_num = row["chan_num"]
+            chan_name = row["chan_name"]
             with h5py.File(mat_basefolder / file, 'r') as f:
                 data_size = f[key]["values"].size
                 fs = 1.0/float(f[key]["interval"][0,0])
@@ -195,7 +196,7 @@ def extract_timing(joined_df: pd.DataFrame, spike2_file, mat_basefolder):
                 j+=1
             times = [p*(divide*time_base) for p in positions]
             if len(times) != 1:
-                raise Exception(f"{len(times)} candidates for period of interest")
+                raise Exception(f"{len(times)} candidates for period of interest. Channel name is {chan_name}")
             chan_start_times.append(times[0])
             chan_end_times.append(times[0]+duration)
     for chan_times in [chan_start_times, chan_end_times]:
