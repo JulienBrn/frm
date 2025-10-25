@@ -86,99 +86,48 @@ async def process_rat_session(session_ds, session_index):
             sig = await checkpoint_xarray(compute_initial_sigs, f"init_sig/{session_str}.zarr", "init_sig", session_index)
             fft = await checkpoint_xarray(lambda: compute_scaled_fft(sig()).sel(f=slice(None, 120)), 
                                         f"fft/{session_str}.zarr", f"fft", session_index)
-            def compute_welch():
-                a = fft()
-                return (np.abs(a)**2).mean("t")
-            welch = await checkpoint_xarray(compute_welch, f"welch/{session_str}.zarr", f"welch", session_index)
-            def compute_coh():
-                a = fft().to_dataset()
+            
+            def add_metadata_to_array(a: xr.DataArray):
+                a = a.to_dataset(name="data")
                 a["chan_num"] = a["chan_num"].compute()
                 df = rawchan_metadata[["chan_group", "structure", "chan_num"]]
                 meta = df.to_xarray().rename(index="channel").set_coords(["chan_group", "structure", "chan_num"]).drop_vars("channel")
                 meta = meta.set_index(channel="chan_num")
                 meta = meta.reindex(channel=a["chan_num"])
                 a = xr.merge([a, meta], join="left")
-                a = a["data"]
+                a = a.drop_vars("channel")
+                return a["data"]
+            def compute_welch():
+                a = fft()
+                a = add_metadata_to_array(a)
+                return (np.abs(a)**2).mean("t")
+            
+            def compute_coh():
+                a = fft()
+                a = add_metadata_to_array(a)
                 def select(a1, a2):
-                    return (a1["sig_type"] == "eeg" ) | ((a1["sig_type"] == a2["sig_type"]) & (a1["structure"] != a2["structure"]))
+                    return ((a1["sig_type"] == "eeg") & (a2["sig_type"] != "eeg")) | ((a1["sig_type"] == a2["sig_type"]) & (a1["structure"] != a2["structure"]))
                 a1, a2 = replicate_dim(a, "channel", 2, select, "stacked", stacked_dim="channel_pair")
                 res = (a1*np.conj(a2)).mean("t")
                 return res
+            welch = await checkpoint_xarray(compute_welch, f"welch/{session_str}.zarr", f"welch", session_index)
             coh = await checkpoint_xarray(compute_coh, f"coh/{session_str}.zarr", f"coh", session_index)
-            return welch, coh, rawchan_metadata
-        # welchs = {}
-        # cohs = {}
-
-        # async def process_sig(func, n):
-        #     sig = await checkpoint_xarray(func, f"{n}/{session_str}.zarr", n, session_index)
-        #     fft = await checkpoint_xarray(lambda: compute_scaled_fft(sig().sel(t=slice(start_t, end_t))).sel(f=slice(None, 120)), f"fft_{n}/{session_str}.zarr", f"fft_{n}", session_index)
-        #     psd = await checkpoint_xarray(lambda: compute_psd_from_scaled_fft(fft()), f"psd_{n}/{session_str}.zarr", f"psd_{n}", session_index)
-        #     welch = await checkpoint_xarray(lambda: compute_welch_from_psd(psd()), f"welch_{n}/{session_str}.zarr", f"welch_{n}", session_index)
-        #     coh = await checkpoint_xarray(lambda: compute_coh_from_psd(psd()), f"coh_{n}/{session_str}.zarr", f"coh_{n}", session_index)
-
-        #     welchs[n] = welch
-        #     cohs[n] = coh
-        
-        # async with anyio.create_task_group() as tg:
-        #     for n, func in initial_sigs.items():
-        #         tg.start_soon(process_sig, func, n)
-            
-        # logger.warning("Concatenating")
-        # if len(welchs) > 0:
-        #     async with lock:
-        #         if not do_stop:
-        #             do_stop = True
-        #             try:
-        #                 # print(welchs)
-        #                 ar = (welchs["lfp"]()).to_dataset()
-        #             # print("\n\n\n\nPRINT\n\n\n\n\n")
-        #                 meta = rawchan_metadata.set_index("chan_num").to_xarray().rename(chan_num="channel")
-        #                 print(meta)
-        #                 print(ar)
-        #                 print(xr.merge([ar, meta[["structure", "chan_group"]]], join="inner"))
-        #                 # print(ar)
-        #             except Exception as e:
-        #                 print("PROBLEM")
-        #                 print(e)
-        #                 raise
-                    # finally:
-                    #     raise KeyboardInterrupt
-        # meta = rawchan_metadata.set_index("chan_num").to_xarray().rename(chan_num="channel")
-        # if len(welchs) > 0:
-        #     def compute_modify(k, a):
-        #         ar: xr.DataArray = a()
-        #         ar = ar.to_dataset()
-        #         ar = ar.assign_coords(sig_type=k, chan_num=ar["channel"]).drop_vars("channel")
-        #         return ar
-        #     session_welch = await checkpoint_xarray(lambda: xr.concat([compute_modify(k, a)for k, a in welchs.items()], dim="channel"),
-        #                                             f"session_welch/{session_str}.zarr", "session_welch", session_index)
-        # if len(cohs) > 0:
-        #     session_coh = await checkpoint_xarray(lambda: xr.concat([compute_modify(k, a) for k, a in cohs.items()], dim="channel"),
-        #                                             f"session_coh/{session_str}.zarr", "session_coh", session_index)
-        # return session_welch, session_coh, rawchan_metadata   
+            return welch, coh, rawchan_metadata  
         except Exception as e:
             logger.exception("Error processing session")
             return e
-    # session_coh = xr.concat(cohs, dim="channel").assign_coords(session=session_str)
-    # return session_welch, session_coh
     
 async def process_sessions(analysis_ds: xr.Dataset):
-    welchs = []
-    cohs = []
-    chan_metadatas = []
+    analysis_ds = analysis_ds.isel(session=slice(0, 40))
+    results = {}
     errors = []
     async def add_session_result(session_ds, session_index):
             result =  await process_rat_session(session_ds, session_index)
             if isinstance(result, Exception):
                 errors.append(result)
             elif result:
-                welch, coh, chan_metadata = result
-                welchs.append(welch)
-                cohs.append(coh)
-                chan_metadatas.append(chan_metadata)
+                results[session_index] = result
             
-
-    
     async with anyio.create_task_group() as tg:
         for s in range(analysis_ds.sizes["session"]):
             ds = analysis_ds.isel(session=s)
@@ -187,6 +136,37 @@ async def process_sessions(analysis_ds: xr.Dataset):
     print(f"#sessions with errors {len(errors)}.")
     for er in errors:
         print(er)
+    print(f"Got {len(results)} valid results")
+    def combine_welch():
+        welchs = []
+        for k, (w, _, meta) in results.items():
+            ar: xr.DataArray = w()
+            session_ds = analysis_ds.isel(session=k)
+            session_info = {k:session_ds[k].item() for k in ["condition", "has_swa", "is_APO", "session_grp", "subject"]}
+            ar = ar.assign_coords(session_info)
+            welchs.append(ar)
+        res = xr.concat(welchs, dim="channel")
+        return res
+    
+    def combine_coherence():
+        coherence = []
+        for k, (_, coh, meta) in results.items():
+            ar: xr.DataArray = coh()
+            session_ds = analysis_ds.isel(session=k)
+            session_info = {k:session_ds[k].item() for k in ["condition", "has_swa", "is_APO", "session_grp", "subject"]}
+            ar = ar.assign_coords(session_info)
+            coherence.append(ar)
+        res = xr.concat(coherence, dim="channel_pair")
+        return res
+    
+    all_welch = (await checkpoint_xarray(combine_welch, f"all_welch.zarr", f"all_welch", 0))()
+    all_coh = (await checkpoint_xarray(combine_coherence, f"all_coh.zarr", f"all_coh", 0))()
+
+    import plotly.express as px
+    print(all_welch)
+    fig = px.line(all_welch.to_dataframe(name="welch").reset_index(), x="f", y="welch", line_dash="condition", color="structure")
+    fig.show()
+
     # print(welchs[0]().compute())
     # print(chan_metadatas[0])
     # all_welch = await checkpoint_xra_zarr(xr.concat(welchs, dim="channel"), base_result_path/f"all_welch.zarr", client)

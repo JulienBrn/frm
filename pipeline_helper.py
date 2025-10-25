@@ -61,7 +61,7 @@ class Limiter:
                 event.set()
 
 groups = {}
-my_limiter = Limiter(5)
+my_limiter = Limiter(10)
 base_result_path = Path("/media/julienb/T7 Shield/Revue-FRM/AnalysisData/")
 
 def add_note_to_exception(exc, note):
@@ -114,6 +114,7 @@ def mk_checkpoint(
                     bar.set_postfix(dict(prev_done=groups[group][1], computing=groups[group][2]))
             shutil.move(tmp_path, path)
             bar.update(1)
+            bar.refresh()
         else:
             groups[group][1]+=1
             bar.set_postfix(dict(prev_done=groups[group][1], computing=groups[group][2]))
@@ -124,10 +125,13 @@ def _load_xarray(path: Path) -> Union[xr.DataArray, xr.Dataset]:
     obj = xr.open_zarr(path)
     if not obj:
         raise Exception("Load result is None...")
-    computed, is_array = obj.attrs.pop("_computed_"), obj.attrs.pop("_is_xrdatarray_")
-    if computed:
-        obj = obj.compute()
-    if is_array:
+    for k in list(obj.data_vars) + list(obj.coords):
+        o: xr.Dataset = obj[k]
+        if obj[k].attrs.pop("__computed_"):
+            obj[k] = obj[k].compute()
+        o.encoding.pop("filters", None)
+
+    if obj.attrs.pop("_is_xrdatarray_"):
         vars = list(obj.data_vars)
         if len(vars) != 1:
             raise Exception("Problem")
@@ -142,7 +146,9 @@ def _save_xarray(obj: Union[xr.DataArray, xr.Dataset], path: Path):
         obj.attrs["_is_xrdatarray_"] = True
     else:
         obj.attrs["_is_xrdatarray_"] = False
-    obj.attrs["_computed_"] = all(not isinstance(v.data, da.Array) for v in obj.variables.values())
+    for k in list(obj.data_vars) + list(obj.coords):
+        obj[k].attrs["__computed_"] = not isinstance(obj[k].data, da.Array)
+        obj[k].encoding.pop("filters", None)
     obj.to_zarr(path, compute=True)
 
 
