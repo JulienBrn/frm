@@ -5,6 +5,7 @@ from dafn.signal_processing import compute_psd_from_scaled_fft, compute_coh_from
 from dafn.signal_processing import compute_bua, compute_lfp, compute_scaled_fft
 from dafn.spike2 import smrxadc2electrophy, smrxchanneldata
 from dafn.signal_processing import compute_lfp, compute_bua
+from dafn.xarray_utilities import replicate_dim
 from pathlib import Path
 import pandas as pd, numpy as np, xarray as xr
 import tqdm.auto as tqdm
@@ -13,11 +14,11 @@ import dask, dask.array as da
 import anyio
 import logging
 import h5py
-# import beautifullogger
-from pipeline_helper import checkpoint_xarray, checkpoint_json
+import beautifullogger
+from pipeline_helper import checkpoint_xarray, checkpoint_json, checkpoint_excel, single
 
 logger = logging.getLogger(__name__)
-# beautifullogger.setup()
+beautifullogger.setup(displayLevel=logging.WARNING)
 
 import warnings
 
@@ -48,67 +49,116 @@ def get_session_info():
     return analysis_ds
 
 
-
-
-
 async def process_rat_session(session_ds, session_index):
-    try:
-        session_str = session_ds["session"].item()
-        spike2_file = session_ds["spike2_file"].item()
-        all_chans = smrxchanneldata(spike2_file)
-        all_raw_chans = all_chans.loc[all_chans["physical_channel"]>= 0].copy()
-        mat_df = get_mat_df(session_ds["mat_file"], mat_basefolder)
-        all_raw_chans = all_raw_chans.merge(mat_spike2_raw_join(mat_df, all_raw_chans), on=all_raw_chans.columns.tolist(), how="left")
-        if pd.isna(all_raw_chans["mat_key"]).all():
-            return None
-        start_t, end_t = (await checkpoint_json(lambda: extract_timing(all_raw_chans, spike2_file, mat_basefolder),
-                                            f"timing/{session_str}.json", "timing", session_index))()
+    async with single(False):
+        try:
+            session_str = session_ds["session"].item()
+            spike2_file = session_ds["spike2_file"].item()
 
-        all_raw_chans["chan_group"] = all_raw_chans["chan_name"].str.lower().apply(rat_raw_chan_classification)
-        probe_chan_nums = all_raw_chans["chan_num"].loc[all_raw_chans["chan_group"]=="Probe"].tolist()
-        ipsieeg_chan_nums = all_raw_chans["chan_num"].loc[all_raw_chans["chan_group"]=="EEGIpsi"].tolist()
+            def get_rawchan_metadata():
+                all_chans = smrxchanneldata(spike2_file)
+                rawchan_metadata = all_chans.loc[all_chans["physical_channel"]>= 0].copy()
+                mat_df = get_mat_df(session_ds["mat_file"], mat_basefolder)
+                rawchan_metadata = rawchan_metadata.merge(mat_spike2_raw_join(mat_df, rawchan_metadata), on=rawchan_metadata.columns.tolist(), how="left")
+                return rawchan_metadata
+            
+            rawchan_metadata = (await checkpoint_excel(get_rawchan_metadata, f"chan_metadata/{session_str}.xlsx", "chan_metadata", session_index))()
+            rawchan_metadata["chan_group"] = rawchan_metadata["chan_name"].str.lower().apply(rat_raw_chan_classification)
+            probe_chan_nums = rawchan_metadata["chan_num"].loc[(rawchan_metadata["chan_group"]=="Probe") & ~pd.isna(rawchan_metadata["structure"])].tolist()
+            ipsieeg_chan_nums = rawchan_metadata["chan_num"].loc[rawchan_metadata["chan_group"]=="EEGIpsi"].tolist()
+
+            if len(probe_chan_nums) == 0:
+                return None
+            start_t, end_t = (await checkpoint_json(lambda: extract_timing(rawchan_metadata, spike2_file, mat_basefolder),
+                                                f"timing/{session_str}.json", "timing", session_index))()
+            
+            
+            def compute_initial_sigs():
+                initial_sigs = {}
+                if len(probe_chan_nums) > 0:
+                    initial_sigs["lfp"] = compute_lfp(smrxadc2electrophy(spike2_file, probe_chan_nums)).assign_coords(sig_type="lfp")
+                    initial_sigs["bua"] = compute_bua(smrxadc2electrophy(spike2_file, probe_chan_nums)).assign_coords(sig_type="bua")
+                if len(ipsieeg_chan_nums) == 1:
+                    initial_sigs["eeg"] = compute_lfp(smrxadc2electrophy(spike2_file, ipsieeg_chan_nums)).assign_coords(sig_type="eeg")
+                res = xr.concat([a for a in initial_sigs.values()], dim="channel").sel(t=slice(start_t, end_t))
+                return res
+
+            sig = await checkpoint_xarray(compute_initial_sigs, f"init_sig/{session_str}.zarr", "init_sig", session_index)
+            fft = await checkpoint_xarray(lambda: compute_scaled_fft(sig()).sel(f=slice(None, 120)), 
+                                        f"fft/{session_str}.zarr", f"fft", session_index)
+            def compute_welch():
+                a = fft()
+                return (np.abs(a)**2).mean("t")
+            welch = await checkpoint_xarray(compute_welch, f"welch/{session_str}.zarr", f"welch", session_index)
+            def compute_coh():
+                a = fft().to_dataset()
+                a["chan_num"] = a["chan_num"].compute()
+                df = rawchan_metadata[["chan_group", "structure", "chan_num"]]
+                meta = df.to_xarray().rename(index="channel").set_coords(["chan_group", "structure", "chan_num"]).drop_vars("channel")
+                meta = meta.set_index(channel="chan_num")
+                meta = meta.reindex(channel=a["chan_num"])
+                a = xr.merge([a, meta], join="left")
+                a = a["data"]
+                def select(a1, a2):
+                    return (a1["sig_type"] == "eeg" ) | ((a1["sig_type"] == a2["sig_type"]) & (a1["structure"] != a2["structure"]))
+                a1, a2 = replicate_dim(a, "channel", 2, select, "stacked", stacked_dim="channel_pair")
+                res = (a1*np.conj(a2)).mean("t")
+                return res
+            coh = await checkpoint_xarray(compute_coh, f"coh/{session_str}.zarr", f"coh", session_index)
+            return welch, coh, rawchan_metadata
+        # welchs = {}
+        # cohs = {}
+
+        # async def process_sig(func, n):
+        #     sig = await checkpoint_xarray(func, f"{n}/{session_str}.zarr", n, session_index)
+        #     fft = await checkpoint_xarray(lambda: compute_scaled_fft(sig().sel(t=slice(start_t, end_t))).sel(f=slice(None, 120)), f"fft_{n}/{session_str}.zarr", f"fft_{n}", session_index)
+        #     psd = await checkpoint_xarray(lambda: compute_psd_from_scaled_fft(fft()), f"psd_{n}/{session_str}.zarr", f"psd_{n}", session_index)
+        #     welch = await checkpoint_xarray(lambda: compute_welch_from_psd(psd()), f"welch_{n}/{session_str}.zarr", f"welch_{n}", session_index)
+        #     coh = await checkpoint_xarray(lambda: compute_coh_from_psd(psd()), f"coh_{n}/{session_str}.zarr", f"coh_{n}", session_index)
+
+        #     welchs[n] = welch
+        #     cohs[n] = coh
         
-
-        initial_sigs = {}
-        if len(probe_chan_nums) > 0:
-            initial_sigs["lfp"] = lambda: compute_lfp(smrxadc2electrophy(spike2_file, probe_chan_nums))
-            initial_sigs["bua"] = lambda: compute_bua(smrxadc2electrophy(spike2_file, probe_chan_nums))
-        else:
-            return None
-        if len(ipsieeg_chan_nums) == 1:
-            initial_sigs["eeg"] = lambda: compute_lfp(smrxadc2electrophy(spike2_file, ipsieeg_chan_nums))
-
-        welchs = {}
-        cohs = {}
-
-        async def process_sig(func, n):
-            sig = await checkpoint_xarray(func, f"{n}/{session_str}.zarr", n, session_index)
-            fft = await checkpoint_xarray(lambda: compute_scaled_fft(sig().sel(t=slice(start_t, end_t))).sel(f=slice(None, 120)), f"fft_{n}/{session_str}.zarr", f"fft_{n}", session_index)
-            psd = await checkpoint_xarray(lambda: compute_psd_from_scaled_fft(fft()), f"psd_{n}/{session_str}.zarr", f"psd_{n}", session_index)
-            welch = await checkpoint_xarray(lambda: compute_welch_from_psd(psd()), f"welch_{n}/{session_str}.zarr", f"welch_{n}", session_index)
-            coh = await checkpoint_xarray(lambda: compute_coh_from_psd(psd()), f"coh_{n}/{session_str}.zarr", f"coh_{n}", session_index)
-
-            welchs[n] = welch
-            cohs[n] = coh
-        
-        async with anyio.create_task_group() as tg:
-            for n, func in initial_sigs.items():
-                tg.start_soon(process_sig, func, n)
+        # async with anyio.create_task_group() as tg:
+        #     for n, func in initial_sigs.items():
+        #         tg.start_soon(process_sig, func, n)
             
         # logger.warning("Concatenating")
-        if len(welchs) > 0:
-            def compute_modify(k, a):
-                ar: xr.DataArray = a()
-                ar = ar.assign_coords(sig_type=k, chan_num=ar["channel"]).drop_vars("channel")
-                return ar
-            session_welch = await checkpoint_xarray(lambda: xr.concat([compute_modify(k, a)for k, a in welchs.items()], dim="channel"),
-                                                    f"session_welch/{session_str}.zarr", "session_welch", session_index)
-        if len(cohs) > 0:
-            session_coh = await checkpoint_xarray(lambda: xr.concat([compute_modify(k, a) for k, a in cohs.items()], dim="channel"),
-                                                    f"session_coh/{session_str}.zarr", "session_coh", session_index)
-        return session_welch, session_coh, all_raw_chans
-    except Exception as e:
-        return e
+        # if len(welchs) > 0:
+        #     async with lock:
+        #         if not do_stop:
+        #             do_stop = True
+        #             try:
+        #                 # print(welchs)
+        #                 ar = (welchs["lfp"]()).to_dataset()
+        #             # print("\n\n\n\nPRINT\n\n\n\n\n")
+        #                 meta = rawchan_metadata.set_index("chan_num").to_xarray().rename(chan_num="channel")
+        #                 print(meta)
+        #                 print(ar)
+        #                 print(xr.merge([ar, meta[["structure", "chan_group"]]], join="inner"))
+        #                 # print(ar)
+        #             except Exception as e:
+        #                 print("PROBLEM")
+        #                 print(e)
+        #                 raise
+                    # finally:
+                    #     raise KeyboardInterrupt
+        # meta = rawchan_metadata.set_index("chan_num").to_xarray().rename(chan_num="channel")
+        # if len(welchs) > 0:
+        #     def compute_modify(k, a):
+        #         ar: xr.DataArray = a()
+        #         ar = ar.to_dataset()
+        #         ar = ar.assign_coords(sig_type=k, chan_num=ar["channel"]).drop_vars("channel")
+        #         return ar
+        #     session_welch = await checkpoint_xarray(lambda: xr.concat([compute_modify(k, a)for k, a in welchs.items()], dim="channel"),
+        #                                             f"session_welch/{session_str}.zarr", "session_welch", session_index)
+        # if len(cohs) > 0:
+        #     session_coh = await checkpoint_xarray(lambda: xr.concat([compute_modify(k, a) for k, a in cohs.items()], dim="channel"),
+        #                                             f"session_coh/{session_str}.zarr", "session_coh", session_index)
+        # return session_welch, session_coh, rawchan_metadata   
+        except Exception as e:
+            logger.exception("Error processing session")
+            return e
     # session_coh = xr.concat(cohs, dim="channel").assign_coords(session=session_str)
     # return session_welch, session_coh
     
@@ -137,26 +187,18 @@ async def process_sessions(analysis_ds: xr.Dataset):
     print(f"#sessions with errors {len(errors)}.")
     for er in errors:
         print(er)
-    print(welchs[0]().compute())
-    print(chan_metadatas[0])
+    # print(welchs[0]().compute())
+    # print(chan_metadatas[0])
     # all_welch = await checkpoint_xra_zarr(xr.concat(welchs, dim="channel"), base_result_path/f"all_welch.zarr", client)
     # all_coh = await checkpoint_xra_zarr(xr.concat(cohs, dim="channel"), base_result_path/f"all_coh.zarr", client)
     # return all_welch, all_coh
 
 async def main():
-    def write(x: xr.Dataset, p: Path):
-        x.to_zarr(p)
     analysis_ds: xr.Dataset = (await checkpoint_xarray(
         get_session_info, 
         "analysis_files.zarr", 
         "files", 0
     ))()
-    
-    # analysis_ds: xr.Dataset = await checkpoint_delayed(
-    #     dask.delayed(get_session_info)(), 
-    #     base_result_path/"analysis_files.zarr", 
-    #     client, write, lambda p: xr.open_zarr(p).compute()
-    # )
     analysis_ds = analysis_ds.sortby("session")
     logger.info("got analysis ds")
     print(analysis_ds)
