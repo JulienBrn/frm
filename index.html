@@ -5,36 +5,55 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Figures Index</title>
   <style>
-    body { font-family: sans-serif; margin: 2em; }
-    ul { line-height: 1.8; }
+    body {
+      font-family: system-ui, sans-serif;
+      margin: 2em;
+      background: #fafafa;
+      color: #333;
+    }
+    h1 {
+      color: #222;
+    }
+    ul {
+      list-style: none;
+      padding: 0;
+    }
+    li {
+      margin: 0.5em 0;
+    }
+    a {
+      text-decoration: none;
+      color: #0066cc;
+      font-weight: 500;
+    }
+    a:hover {
+      text-decoration: underline;
+    }
   </style>
 </head>
 <body>
   <h1>Figures</h1>
-  <ul id="fileList"></ul>
+  <ul id="figures-list"></ul>
 
   <script>
-    // List your HTML files here (relative to /figures)
-    const htmlFiles = [
+    // 👇 List your HTML figure files here
+    const figures = [
       "pwelch_bua_rats.html",
       "coh_power_bua_rats.html",
       "coh_phase_bua_rats.html"
     ];
 
-    const list = document.getElementById("fileList");
-    htmlFiles.forEach(file => {
+    const list = document.getElementById("figures-list");
+
+    // Dynamically create links
+    figures.forEach(file => {
       const li = document.createElement("li");
       const a = document.createElement("a");
-      a.href = "figures/" + file;
-      a.textContent = file;
+      a.href = `figures/${file}`;
+      a.textContent = file.replace(".html", ""); // show name without extension
       li.appendChild(a);
       list.appendChild(li);
     });
-
-    // Optional: automatically redirect to the first one
-    if (htmlFiles.length > 0) {
-      window.location.href = "figures/" + htmlFiles[0];
-    }
   </script>
 </body>
 </html>
