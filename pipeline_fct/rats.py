@@ -131,11 +131,11 @@ def mat_spike2_raw_join(mat_df: pd.DataFrame, raw_df: pd.DataFrame) -> pd.DataFr
         raw_idx = np.flatnonzero((equals.sum(axis=0) > 1))
         # print(raw_df.iloc[raw_idx])
         # print(mat_df)
-        logger.warning("A raw matches several mats")
+        raise Exception("A raw matches several mats")
     if (equals.sum(axis=1) > 1).any():
         # print(raw_df)
         # print(mat_df)
-        logger.warning("A mat matches several raw")
+        raise Exception("A mat matches several raw")
     if (equals.sum(axis=1) == 0).any():
         mat_idx = np.flatnonzero((equals.sum(axis=1) == 0))
         # print(mat_df.iloc[mat_idx])

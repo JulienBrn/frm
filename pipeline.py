@@ -118,7 +118,8 @@ async def process_rat_session(session_ds, session_index):
             return e
     
 async def process_sessions(analysis_ds: xr.Dataset):
-    analysis_ds = analysis_ds.isel(session=slice(0, 40))
+    analysis_ds = analysis_ds
+    # .isel(session=slice(0, 180))
     results = {}
     errors = []
     async def add_session_result(session_ds, session_index):
@@ -150,22 +151,20 @@ async def process_sessions(analysis_ds: xr.Dataset):
     
     def combine_coherence():
         coherence = []
-        for k, (_, coh, meta) in results.items():
-            ar: xr.DataArray = coh()
+        for k, (_, coh, meta) in tqdm.tqdm(results.items()):
+            ar: xr.DataArray = coh().compute()
             session_ds = analysis_ds.isel(session=k)
             session_info = {k:session_ds[k].item() for k in ["condition", "has_swa", "is_APO", "session_grp", "subject"]}
             ar = ar.assign_coords(session_info)
             coherence.append(ar)
         res = xr.concat(coherence, dim="channel_pair")
+        print(res)
         return res
     
     all_welch = (await checkpoint_xarray(combine_welch, f"all_welch.zarr", f"all_welch", 0))()
     all_coh = (await checkpoint_xarray(combine_coherence, f"all_coh.zarr", f"all_coh", 0))()
 
-    import plotly.express as px
-    print(all_welch)
-    fig = px.line(all_welch.to_dataframe(name="welch").reset_index(), x="f", y="welch", line_dash="condition", color="structure")
-    fig.show()
+    
 
     # print(welchs[0]().compute())
     # print(chan_metadatas[0])
