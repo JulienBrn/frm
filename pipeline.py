@@ -138,15 +138,17 @@ async def process_sessions(analysis_ds: xr.Dataset):
     for er in errors:
         print(er)
     print(f"Got {len(results)} valid results")
+    session_metadata_cols = ["condition", "has_swa", "is_APO", "session_grp", "subject", "session"]
+
     def combine_welch():
         welchs = []
         for k, (w, _, meta) in results.items():
-            ar: xr.DataArray = w()
+            ar: xr.DataArray = w().compute()
             session_ds = analysis_ds.isel(session=k)
-            session_info = {k:session_ds[k].item() for k in ["condition", "has_swa", "is_APO", "session_grp", "subject"]}
+            session_info = {k:session_ds[k].item() for k in session_metadata_cols}
             ar = ar.assign_coords(session_info)
             welchs.append(ar)
-        res = xr.concat(welchs, dim="channel")
+        res = xr.concat(welchs, dim="channel").compute()
         return res
     
     def combine_coherence():
@@ -154,11 +156,11 @@ async def process_sessions(analysis_ds: xr.Dataset):
         for k, (_, coh, meta) in tqdm.tqdm(results.items()):
             ar: xr.DataArray = coh().compute()
             session_ds = analysis_ds.isel(session=k)
-            session_info = {k:session_ds[k].item() for k in ["condition", "has_swa", "is_APO", "session_grp", "subject"]}
+            session_info = {k:session_ds[k].item() for k in session_metadata_cols}
             ar = ar.assign_coords(session_info)
             coherence.append(ar)
-        res = xr.concat(coherence, dim="channel_pair")
-        print(res)
+        res = xr.concat(coherence, dim="channel_pair").compute()
+        print("Storing to zarr")
         return res
     
     all_welch = (await checkpoint_xarray(combine_welch, f"all_welch.zarr", f"all_welch", 0))()
