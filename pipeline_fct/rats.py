@@ -5,6 +5,7 @@ from typing import Literal, Dict, List, Union, Any
 import re, h5py
 from dafn.spike2 import smrxadc2electrophy, smrxchanneldata, sonfile
 from dafn.signal_processing import compute_lfp, compute_bua
+from dafn.utilities import get_subsequence_positions
 import logging
 logger = logging.getLogger(__name__)
 
@@ -148,26 +149,7 @@ def mat_spike2_raw_join(mat_df: pd.DataFrame, raw_df: pd.DataFrame) -> pd.DataFr
 
     return matched
 
-def get_subsequence_positions(sub, a, tol=10**(-6)):
-    if sub.size > a.size:
-        return []
-    candidates = np.ones(a.size, dtype=bool)
-    i= 0
-    while i<sub.size:
-        candidates = candidates & (np.abs(np.roll(a, -i) - sub[i]) < tol)
-        sum = candidates.sum()
-        if sum < 50:
-            break
-        i+=1
-            
-    candidates = np.flatnonzero(candidates)
-    res = []
-    for i in candidates:
-        if (a.size - i) < sub.size:
-            break
-        if (np.abs(a[i:i+sub.size] - sub) < tol).all():
-            res.append(i)
-    return res
+
 
 def extract_timing(joined_df: pd.DataFrame, spike2_file, mat_basefolder):
     joined_df = joined_df.dropna(subset="mat_key")
