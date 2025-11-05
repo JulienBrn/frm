@@ -3,6 +3,8 @@ import tqdm.auto as tqdm
 from pathlib import Path
 from typing import Literal, Dict, List, Union, Any
 import re, h5py
+import dask.array as da
+from dask import delayed
 from dafn.spike2 import smrxadc2electrophy, smrxchanneldata, sonfile
 from dafn.signal_processing import compute_lfp, compute_bua
 from dafn.utilities import get_subsequence_positions
@@ -31,8 +33,9 @@ def rat_raw_chan_classification(name: str):
     for pattern, label in patterns.items():
         if re.match(pattern, name):
             return label
+    
         
-def get_smrx_metadata(smrx_paths: List[Path]):
+def get_smrx_metadata(smrx_paths: List[Path]) -> pd.DataFrame:
     ret_condition = {"Beta work":"Park", "Control work": "CTL"}
 
     spike2df = pd.DataFrame()
@@ -60,7 +63,7 @@ def get_smrx_metadata(smrx_paths: List[Path]):
     spike2df["segment_index"] = [t[1] for t in session_and_segments]
     return spike2df
 
-def get_matfile_metadata(mat_files: List[Path]):
+def get_matfile_metadata(mat_files: List[Path]) -> pd.DataFrame:
     mat_df = pd.DataFrame()
     mat_df["mat_file"] = mat_files
     mat_df["mat_date"] = [f.parts[2] for f in mat_files]
@@ -78,24 +81,7 @@ def get_matfile_metadata(mat_files: List[Path]):
     mat_df = mat_df.drop(columns="session_info")
     return mat_df
 
-# def get_initial_signals(raw_file):
-#     all_chans = smrxchanneldata(raw_file)
-#     all_raw_chans = all_chans.loc[all_chans["physical_channel"]>= 0].copy()
-#     all_raw_chans["chan_group"] = all_raw_chans["chan_name"].str.lower().apply(rat_raw_chan_classification)
-#     probe_chan_nums = all_raw_chans["chan_num"].loc[all_raw_chans["chan_group"]=="Probe"].tolist()
-#     ipsieeg_chan_nums = all_raw_chans["chan_num"].loc[all_raw_chans["chan_group"]=="EEGIpsi"].tolist()
-#     if len(probe_chan_nums) == 0:
-#        return None
-#     if len(ipsieeg_chan_nums) != 1:
-#        raise Exception(f"Got {len(ipsieeg_chan_nums)} ipsi eeg")
-#     with smrxadc2electrophy(raw_file, probe_chan_nums) as raw:
-#       lfp = compute_lfp(raw)
-#       bua = compute_bua(raw)
-#       with smrxadc2electrophy(raw_file, ipsieeg_chan_nums) as raw_eeg:
-#         eeg = compute_lfp(raw_eeg)
-#         return lfp, bua, eeg
-      
-def get_mat_df(xr_mats: xr.DataArray, base_folder):
+def get_mat_df(xr_mats: xr.DataArray, base_folder: Path):
     df = xr_mats.to_dataframe(name="mat_path").reset_index()
     df = df.loc[df["mat_path"]!=""]
     rows = []
@@ -114,84 +100,6 @@ def get_mat_df(xr_mats: xr.DataArray, base_folder):
     res["chan_num"] = res["chan_num"].astype('Int64')
     return res
 
-def mat_spike2_raw_join(mat_df: pd.DataFrame, raw_df: pd.DataFrame) -> pd.DataFrame:
-    endswith_vec = np.frompyfunc(lambda a, b: a.endswith(b), 2, 1)
-
-    chan_num_mat = mat_df["chan_num"].to_numpy()
-    chan_key_mat = mat_df["mat_key"].astype(str).to_numpy()
-
-    chan_num_raw = raw_df["chan_num"].to_numpy()
-    chan_name_raw = raw_df["chan_name"].astype(str).to_numpy()
-
-    equals_1 = chan_num_mat[:, None] == chan_num_raw[None, :]
-    equals_2 = chan_key_mat[:, None] == chan_name_raw[None, :]
-    equals_3 = endswith_vec(chan_key_mat[:, None], chan_name_raw[None, :]).astype(bool)
-    equals = equals_1 | equals_2 | equals_3
-
-    if (equals.sum(axis=0) > 1).any():
-        raw_idx = np.flatnonzero((equals.sum(axis=0) > 1))
-        # print(raw_df.iloc[raw_idx])
-        # print(mat_df)
-        raise Exception("A raw matches several mats")
-    if (equals.sum(axis=1) > 1).any():
-        # print(raw_df)
-        # print(mat_df)
-        raise Exception("A mat matches several raw")
-    if (equals.sum(axis=1) == 0).any():
-        mat_idx = np.flatnonzero((equals.sum(axis=1) == 0))
-        # print(mat_df.iloc[mat_idx])
-        # print(raw_df)
-        # logger.warning("Missing matches")
-
-    mat_idx, raw_idx = np.where(equals & (equals.sum(axis=1)==1)[:, None]  & (equals.sum(axis=0)==1)[None, :])
-    matched = mat_df.iloc[mat_idx].drop(columns="chan_num").reset_index(drop=True).join(
-        raw_df.iloc[raw_idx].reset_index(drop=True))
-
-    return matched
-
-
-
-def extract_timing(joined_df: pd.DataFrame, spike2_file, mat_basefolder):
-    joined_df = joined_df.dropna(subset="mat_key")
-    chan_start_times = []
-    chan_end_times = []
-    with sonfile(spike2_file) as rec:
-        time_base = rec.GetTimeBase()
-        for _, row in joined_df.iterrows():
-            key = row["mat_key"]
-            file = row["mat_path"]
-            chan_num = row["chan_num"]
-            chan_name = row["chan_name"]
-            with h5py.File(mat_basefolder / file, 'r') as f:
-                data_size = f[key]["values"].size
-                fs = 1.0/float(f[key]["interval"][0,0])
-                duration = data_size/fs
-                subarray = np.array(f[key]["values"][0, :1000])
-            j = 0
-            chunk_size = 10**7
-            divide = rec.ChannelDivide(chan_num)
-            positions = []
-            while True:
-                chunk = np.array(rec.ReadFloats(chan_num, chunk_size, int(divide*j*(chunk_size-subarray.size))))
-                ps = get_subsequence_positions(subarray, chunk)
-                positions+=[int(p+j*(chunk_size-subarray.size)) for p in ps]
-                if len(chunk) < chunk_size:
-                    break
-                j+=1
-            times = [p*(divide*time_base) for p in positions]
-            if len(times) != 1:
-                raise Exception(f"{len(times)} candidates for period of interest. Channel name is {chan_name}")
-            chan_start_times.append(times[0])
-            chan_end_times.append(times[0]+duration)
-    for chan_times in [chan_start_times, chan_end_times]:
-        chan_times = np.array(chan_times)
-        if (np.abs(chan_times - chan_times.mean()) > 10**-4).any():
-            print(chan_times)
-            raise Exception("Not all same times")
-    return np.array(chan_start_times).mean(), np.array(chan_end_times).mean()
-
-
-
 def may_match(spike2: pd.DataFrame, mat: pd.DataFrame, mat_basefolder: Path, spike2_file: Path):
     chan = int(spike2["chan_num"])
 
@@ -200,6 +108,8 @@ def may_match(spike2: pd.DataFrame, mat: pd.DataFrame, mat_basefolder: Path, spi
             with h5py.File(mat_basefolder / mat["mat_path"], 'r') as f:
                 data_size = f[mat["mat_key"]]["values"].size
                 subarray = np.array(f[mat["mat_key"]]["values"][0, :1000])
+                # display(chan)
+                # display(subarray)
             with sonfile(spike2_file) as rec:
               time_base = rec.GetTimeBase()
               divide = rec.ChannelDivide(chan)
@@ -214,6 +124,7 @@ def may_match(spike2: pd.DataFrame, mat: pd.DataFrame, mat_basefolder: Path, spi
                 return dict(delta_t=s[0]*divide*time_base, common_duration=data_size*divide*time_base)
         else:
             return False
+        
     elif spike2["physical_channel"] < 0 and mat["signal_type"]=="units" and spike2["chan_type"] == "EventRise":
         with sonfile(spike2_file) as rec:
             time_base = rec.GetTimeBase()
@@ -229,6 +140,169 @@ def may_match(spike2: pd.DataFrame, mat: pd.DataFrame, mat_basefolder: Path, spi
         elif len(s) == 0:
             return False
         else:
-            return dict(delta_t=evs[s[0]] - a[0], common_duration=evs[s[0]+len(a)-1] - a[0])
+            return dict(delta_t=evs[s[0]] - a[0], common_duration=evs[s[0]+len(a)-1] - (evs[s[0]] - a[0]))
     else:
         return False
+    
+def get_probe_data(probe_chans: pd.DataFrame, delta_t: float, duration: float, spike2_file: Path):
+  with sonfile(spike2_file) as rec:
+     time_base = rec.GetTimeBase()
+  fs = probe_chans["fs"].iat[0]
+  if (probe_chans["fs"] != fs).any():
+      raise Exception("Not same fs")
+  n_data_points = int(duration*fs)
+  def read_chan(chan):
+      with sonfile(spike2_file) as rec:
+          data = np.array(rec.ReadFloats(chan, n_data_points, int(delta_t/time_base)))
+      return data
+
+  ars = []
+  for chan in probe_chans["chan_num"]:
+    ar =da.from_delayed(delayed(read_chan)(chan), shape=(n_data_points, ), dtype=float)
+    ars.append(ar)
+  d = da.stack(ars)
+  probe_ar = xr.DataArray(d, dims=("channel", "t"))
+  probe_ar["t"] = np.arange(n_data_points)/fs + delta_t
+  probe_ar["t"].attrs["fs"] = fs
+  probe_ar["chan_num"] = xr.DataArray(probe_chans["chan_num"].values, dims="channel")
+  probe_ar = probe_ar.chunk(channel="auto")
+  return probe_ar
+
+def compute_neuron_data(neuron_chans: pd.DataFrame, t: xr.DataArray, spike2_file: Path):
+    with sonfile(spike2_file) as rec:
+      time_base = rec.GetTimeBase()
+
+    def read_chan(chan):
+      with sonfile(spike2_file) as rec:
+          data = np.array(rec.ReadEvents(chan, 10**9, int(t.isel(t=0).item()/time_base), int(t.isel(t=-1).item()/time_base)))*time_base
+      indices = ((data - t.isel(t=0).item())*t.attrs["fs"]).astype(int)
+      ar = np.zeros(t.sizes["t"], dtype=float)
+      np.add.at(ar, indices, 1.0)
+      return ar
+    
+    ars = []
+    for chan in neuron_chans["chan_num"]:
+      ar =da.from_delayed(delayed(read_chan)(chan), shape=(t.size, ), dtype=float)
+      ars.append(ar)
+    d = da.stack(ars)
+    neuron_ar = xr.DataArray(d, dims=("channel", "t"))
+    neuron_ar["t"] = t
+    neuron_ar["chan_num"] = xr.DataArray(neuron_chans["chan_num"].values, dims="channel")
+    neuron_ar = neuron_ar.chunk(channel="auto")
+    return neuron_ar
+
+def get_initial_sigs(all_chans, spike2_file):
+  if (np.abs(all_chans["start_t"]) > 10**-3).any():
+    raise Exception("start_t problem")
+  delta_t = all_chans["delta_t"].max()
+  if (np.abs(all_chans["delta_t"] - delta_t) > 10**-3).any():
+      raise Exception("delta_t problem")
+  duration = all_chans["common_duration"].min()+0.005
+  probe_data = get_probe_data(all_chans.loc[all_chans["chan_group"] == "Probe"], delta_t, duration, spike2_file)
+  lfp = compute_lfp(probe_data).assign_coords(sig_type="lfp")
+  bua = compute_bua(probe_data).assign_coords(sig_type="bua")
+  eeg = compute_lfp(get_probe_data(all_chans.loc[all_chans["chan_group"] == "EEGIpsi"], delta_t, duration, spike2_file)).assign_coords(sig_type="eeg")
+
+  neuron_data = compute_neuron_data(all_chans.loc[all_chans["chan_group"] == "neuron"], lfp["t"], spike2_file).assign_coords(sig_type="neuron")
+
+  all = xr.concat([eeg, lfp, bua, neuron_data], dim="channel").chunk(t=-1, channel="auto")
+  return all
+
+
+# def get_initial_signals(raw_file):
+#     all_chans = smrxchanneldata(raw_file)
+#     all_raw_chans = all_chans.loc[all_chans["physical_channel"]>= 0].copy()
+#     all_raw_chans["chan_group"] = all_raw_chans["chan_name"].str.lower().apply(rat_raw_chan_classification)
+#     probe_chan_nums = all_raw_chans["chan_num"].loc[all_raw_chans["chan_group"]=="Probe"].tolist()
+#     ipsieeg_chan_nums = all_raw_chans["chan_num"].loc[all_raw_chans["chan_group"]=="EEGIpsi"].tolist()
+#     if len(probe_chan_nums) == 0:
+#        return None
+#     if len(ipsieeg_chan_nums) != 1:
+#        raise Exception(f"Got {len(ipsieeg_chan_nums)} ipsi eeg")
+#     with smrxadc2electrophy(raw_file, probe_chan_nums) as raw:
+#       lfp = compute_lfp(raw)
+#       bua = compute_bua(raw)
+#       with smrxadc2electrophy(raw_file, ipsieeg_chan_nums) as raw_eeg:
+#         eeg = compute_lfp(raw_eeg)
+#         return lfp, bua, eeg
+      
+
+
+# def mat_spike2_raw_join(mat_df: pd.DataFrame, raw_df: pd.DataFrame) -> pd.DataFrame:
+#     endswith_vec = np.frompyfunc(lambda a, b: a.endswith(b), 2, 1)
+
+#     chan_num_mat = mat_df["chan_num"].to_numpy()
+#     chan_key_mat = mat_df["mat_key"].astype(str).to_numpy()
+
+#     chan_num_raw = raw_df["chan_num"].to_numpy()
+#     chan_name_raw = raw_df["chan_name"].astype(str).to_numpy()
+
+#     equals_1 = chan_num_mat[:, None] == chan_num_raw[None, :]
+#     equals_2 = chan_key_mat[:, None] == chan_name_raw[None, :]
+#     equals_3 = endswith_vec(chan_key_mat[:, None], chan_name_raw[None, :]).astype(bool)
+#     equals = equals_1 | equals_2 | equals_3
+
+#     if (equals.sum(axis=0) > 1).any():
+#         raw_idx = np.flatnonzero((equals.sum(axis=0) > 1))
+#         # print(raw_df.iloc[raw_idx])
+#         # print(mat_df)
+#         raise Exception("A raw matches several mats")
+#     if (equals.sum(axis=1) > 1).any():
+#         # print(raw_df)
+#         # print(mat_df)
+#         raise Exception("A mat matches several raw")
+#     if (equals.sum(axis=1) == 0).any():
+#         mat_idx = np.flatnonzero((equals.sum(axis=1) == 0))
+#         # print(mat_df.iloc[mat_idx])
+#         # print(raw_df)
+#         # logger.warning("Missing matches")
+
+#     mat_idx, raw_idx = np.where(equals & (equals.sum(axis=1)==1)[:, None]  & (equals.sum(axis=0)==1)[None, :])
+#     matched = mat_df.iloc[mat_idx].drop(columns="chan_num").reset_index(drop=True).join(
+#         raw_df.iloc[raw_idx].reset_index(drop=True))
+
+#     return matched
+
+
+
+# def extract_timing(joined_df: pd.DataFrame, spike2_file, mat_basefolder):
+#     joined_df = joined_df.dropna(subset="mat_key")
+#     chan_start_times = []
+#     chan_end_times = []
+#     with sonfile(spike2_file) as rec:
+#         time_base = rec.GetTimeBase()
+#         for _, row in joined_df.iterrows():
+#             key = row["mat_key"]
+#             file = row["mat_path"]
+#             chan_num = row["chan_num"]
+#             chan_name = row["chan_name"]
+#             with h5py.File(mat_basefolder / file, 'r') as f:
+#                 data_size = f[key]["values"].size
+#                 fs = 1.0/float(f[key]["interval"][0,0])
+#                 duration = data_size/fs
+#                 subarray = np.array(f[key]["values"][0, :1000])
+#             j = 0
+#             chunk_size = 10**7
+#             divide = rec.ChannelDivide(chan_num)
+#             positions = []
+#             while True:
+#                 chunk = np.array(rec.ReadFloats(chan_num, chunk_size, int(divide*j*(chunk_size-subarray.size))))
+#                 ps = get_subsequence_positions(subarray, chunk)
+#                 positions+=[int(p+j*(chunk_size-subarray.size)) for p in ps]
+#                 if len(chunk) < chunk_size:
+#                     break
+#                 j+=1
+#             times = [p*(divide*time_base) for p in positions]
+#             if len(times) != 1:
+#                 raise Exception(f"{len(times)} candidates for period of interest. Channel name is {chan_name}")
+#             chan_start_times.append(times[0])
+#             chan_end_times.append(times[0]+duration)
+#     for chan_times in [chan_start_times, chan_end_times]:
+#         chan_times = np.array(chan_times)
+#         if (np.abs(chan_times - chan_times.mean()) > 10**-4).any():
+#             print(chan_times)
+#             raise Exception("Not all same times")
+#     return np.array(chan_start_times).mean(), np.array(chan_end_times).mean()
+
+
+
