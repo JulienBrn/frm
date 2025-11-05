@@ -175,22 +175,37 @@ checkpoint_excel =  mk_checkpoint(_save_excel, _load_excel)
 lock = anyio.Lock()
 do_stop = False
 
+class _Single:
+    def __init__(self, lock: anyio.Lock, stop: anyio.Event):
+        self.lock, self.stop = lock, stop
+
+    async def __aenter__(self):
+        await self.lock.acquire()
+        if self.stop.is_set():
+            self.lock.release()
+            # Wait indefinitely, but cooperatively cancellable
+            await anyio.Event().wait()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        try:
+            if exc_type:
+                self.stop.set()
+        finally:
+            self.lock.release()
+
+_lock = anyio.Lock()
+_event_lock = anyio.Event()
+
 @asynccontextmanager
-async def single(yes=True):
-    global lock, do_stop
+async def _noop_async_cm():
+    yield
+
+def single(yes: bool = True):
     if yes:
-        async with lock:
-            if not do_stop:
-                try:
-                    yield
-                except:
-                    do_stop=True
-                    raise
-            else:
-                await anyio.sleep(10000)
+        return _Single(_lock, _event_lock)
     else:
-        yield
-        
+        return _noop_async_cm()
 
 # async def checkpoint_xarray(func, path: Path, group: str, priority: float):
 #     id = str(path)

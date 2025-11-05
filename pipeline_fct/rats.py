@@ -95,7 +95,7 @@ def get_matfile_metadata(mat_files: List[Path]):
 #         return lfp, bua, eeg
       
 def get_mat_df(xr_mats: xr.DataArray, base_folder):
-    df = xr_mats.sel(signal_type="raw", drop=True).to_dataframe(name="mat_path").reset_index()
+    df = xr_mats.to_dataframe(name="mat_path").reset_index()
     df = df.loc[df["mat_path"]!=""]
     rows = []
     for _, row in df.iterrows():
@@ -149,6 +149,8 @@ def mat_spike2_raw_join(mat_df: pd.DataFrame, raw_df: pd.DataFrame) -> pd.DataFr
     return matched
 
 def get_subsequence_positions(sub, a, tol=10**(-6)):
+    if sub.size > a.size:
+        return []
     candidates = np.ones(a.size, dtype=bool)
     i= 0
     while i<sub.size:
@@ -205,3 +207,46 @@ def extract_timing(joined_df: pd.DataFrame, spike2_file, mat_basefolder):
             print(chan_times)
             raise Exception("Not all same times")
     return np.array(chan_start_times).mean(), np.array(chan_end_times).mean()
+
+
+
+def may_match(spike2: pd.DataFrame, mat: pd.DataFrame, mat_basefolder: Path, spike2_file: Path):
+    chan = int(spike2["chan_num"])
+
+    if spike2["physical_channel"] >= 0 and mat["signal_type"]=="raw" and spike2["chan_type"] == "Adc":
+        if (pd.notna(mat["chan_num"])  and spike2["chan_num"] == mat["chan_num"]) or mat["mat_key"].endswith(spike2["chan_name"]):
+            with h5py.File(mat_basefolder / mat["mat_path"], 'r') as f:
+                data_size = f[mat["mat_key"]]["values"].size
+                subarray = np.array(f[mat["mat_key"]]["values"][0, :1000])
+            with sonfile(spike2_file) as rec:
+              time_base = rec.GetTimeBase()
+              divide = rec.ChannelDivide(chan)
+              data = np.array(rec.ReadFloats(chan, 2*10**9, rec.FirstTime(chan, 0, rec.ChannelMaxTime(chan))))
+
+            s = get_subsequence_positions(subarray, data)
+            if len(s) > 1:
+              raise Exception("Problem")
+            elif len(s) == 0:
+                return False
+            else:
+                return dict(delta_t=s[0]*divide*time_base, common_duration=data_size*divide*time_base)
+        else:
+            return False
+    elif spike2["physical_channel"] < 0 and mat["signal_type"]=="units" and spike2["chan_type"] == "EventRise":
+        with sonfile(spike2_file) as rec:
+            time_base = rec.GetTimeBase()
+            evs = np.array(rec.ReadEvents(chan, 10**7, rec.FirstTime(chan, 0, rec.ChannelMaxTime(chan))))
+            evs = evs*time_base
+
+        with h5py.File(mat_basefolder / mat["mat_path"], 'r') as f:
+            a = np.array(f[mat["mat_key"]]["times"][0])
+
+        s = get_subsequence_positions(np.diff(a), np.diff(evs))
+        if len(s) > 1:
+            raise Exception("Problem")
+        elif len(s) == 0:
+            return False
+        else:
+            return dict(delta_t=evs[s[0]] - a[0], common_duration=evs[s[0]+len(a)-1] - a[0])
+    else:
+        return False
