@@ -8,8 +8,11 @@ from dask import delayed
 from dafn.spike2 import smrxadc2electrophy, smrxchanneldata, sonfile
 from dafn.signal_processing import compute_lfp, compute_bua
 from dafn.utilities import get_subsequence_positions
+from dafn.xarray_utilities import chunk
 import logging
 logger = logging.getLogger(__name__)
+
+class KnownError(Exception): pass
 
 def print_h5_tree(name, obj):
     if isinstance(obj, h5py.Dataset):
@@ -108,8 +111,6 @@ def may_match(spike2: pd.DataFrame, mat: pd.DataFrame, mat_basefolder: Path, spi
             with h5py.File(mat_basefolder / mat["mat_path"], 'r') as f:
                 data_size = f[mat["mat_key"]]["values"].size
                 subarray = np.array(f[mat["mat_key"]]["values"][0, :1000])
-                # display(chan)
-                # display(subarray)
             with sonfile(spike2_file) as rec:
               time_base = rec.GetTimeBase()
               divide = rec.ChannelDivide(chan)
@@ -145,6 +146,9 @@ def may_match(spike2: pd.DataFrame, mat: pd.DataFrame, mat_basefolder: Path, spi
         return False
     
 def get_probe_data(probe_chans: pd.DataFrame, delta_t: float, duration: float, spike2_file: Path):
+  if probe_chans.empty:
+      return xr.DataArray(np.full((0, 0), dtype=float, fill_value=0), dims=("channel", "t")).assign_coords(t=[], chan_num=("channel", []))
+      
   with sonfile(spike2_file) as rec:
      time_base = rec.GetTimeBase()
   fs = probe_chans["fs"].iat[0]
@@ -165,7 +169,7 @@ def get_probe_data(probe_chans: pd.DataFrame, delta_t: float, duration: float, s
   probe_ar["t"] = np.arange(n_data_points)/fs + delta_t
   probe_ar["t"].attrs["fs"] = fs
   probe_ar["chan_num"] = xr.DataArray(probe_chans["chan_num"].values, dims="channel")
-  probe_ar = probe_ar.chunk(channel="auto")
+  probe_ar = chunk(probe_ar, channel=1)
   return probe_ar
 
 def compute_neuron_data(neuron_chans: pd.DataFrame, t: xr.DataArray, spike2_file: Path):
@@ -174,7 +178,7 @@ def compute_neuron_data(neuron_chans: pd.DataFrame, t: xr.DataArray, spike2_file
 
     def read_chan(chan):
       with sonfile(spike2_file) as rec:
-          data = np.array(rec.ReadEvents(chan, 10**9, int(t.isel(t=0).item()/time_base), int(t.isel(t=-1).item()/time_base)))*time_base
+          data = np.array(rec.ReadEvents(chan, 10**7, int(t.isel(t=0).item()/time_base), int(t.isel(t=-1).item()/time_base)))*time_base
       indices = ((data - t.isel(t=0).item())*t.attrs["fs"]).astype(int)
       ar = np.zeros(t.sizes["t"], dtype=float)
       np.add.at(ar, indices, 1.0)
@@ -188,7 +192,7 @@ def compute_neuron_data(neuron_chans: pd.DataFrame, t: xr.DataArray, spike2_file
     neuron_ar = xr.DataArray(d, dims=("channel", "t"))
     neuron_ar["t"] = t
     neuron_ar["chan_num"] = xr.DataArray(neuron_chans["chan_num"].values, dims="channel")
-    neuron_ar = neuron_ar.chunk(channel="auto")
+    neuron_ar = chunk(neuron_ar, channel=1)
     return neuron_ar
 
 def get_initial_sigs(all_chans, spike2_file):
@@ -197,15 +201,21 @@ def get_initial_sigs(all_chans, spike2_file):
   delta_t = all_chans["delta_t"].max()
   if (np.abs(all_chans["delta_t"] - delta_t) > 10**-3).any():
       raise Exception("delta_t problem")
-  duration = all_chans["common_duration"].min()+0.005
+  duration = all_chans["common_duration"].min()
   probe_data = get_probe_data(all_chans.loc[all_chans["chan_group"] == "Probe"], delta_t, duration, spike2_file)
-  lfp = compute_lfp(probe_data).assign_coords(sig_type="lfp")
-  bua = compute_bua(probe_data).assign_coords(sig_type="bua")
-  eeg = compute_lfp(get_probe_data(all_chans.loc[all_chans["chan_group"] == "EEGIpsi"], delta_t, duration, spike2_file)).assign_coords(sig_type="eeg")
-
-  neuron_data = compute_neuron_data(all_chans.loc[all_chans["chan_group"] == "neuron"], lfp["t"], spike2_file).assign_coords(sig_type="neuron")
-
-  all = xr.concat([eeg, lfp, bua, neuron_data], dim="channel").chunk(t=-1, channel="auto")
+  eeg_data = get_probe_data(all_chans.loc[all_chans["chan_group"] == "EEGIpsi"], delta_t, duration, spike2_file)
+  all_sigs_ar = []
+  if probe_data.size > 0:
+    all_sigs_ar.append(compute_lfp(probe_data).assign_coords(sig_type=("channel", ["lfp"] * probe_data.sizes["channel"])))
+    all_sigs_ar.append(compute_bua(probe_data).assign_coords(sig_type=("channel", ["bua"] * probe_data.sizes["channel"])))
+  if eeg_data.size > 0:
+    all_sigs_ar.append(compute_lfp(eeg_data).assign_coords(sig_type=("channel", ["eeg"] * eeg_data.sizes["channel"])))
+  if len(all_sigs_ar)  == 0:
+    raise KnownError("Data is empty")
+  neuron_data = all_chans.loc[all_chans["chan_group"] == "neuron"]
+  if not neuron_data.empty:
+    all_sigs_ar.append(compute_neuron_data(neuron_data, all_sigs_ar[0]["t"], spike2_file).assign_coords(sig_type=("channel", ["neuron"]*len(neuron_data.index))))
+  all = chunk(xr.concat(all_sigs_ar, dim="channel"), t=-1, channel=1)
   return all
 
 

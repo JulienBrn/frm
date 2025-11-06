@@ -1,11 +1,14 @@
 from json import load
 import anyio.to_thread
 # from dafn.dask_helper import checkpoint_xra_zarr, checkpoint_xrds_zarr, checkpoint_delayed
-from pipeline_fct.rats import get_matfile_metadata, get_smrx_metadata, rat_raw_chan_classification, get_mat_df, mat_spike2_raw_join, extract_timing
+from dafn.xarray_utilities import xr_merge, chunk, replicate_dim
+from pipeline_fct.rats import get_matfile_metadata, get_smrx_metadata, rat_raw_chan_classification, get_mat_df, get_initial_sigs, may_match
 from dafn.signal_processing import compute_bua, compute_lfp, compute_scaled_fft
 from dafn.spike2 import smrxadc2electrophy, smrxchanneldata, sonfile
 from dafn.signal_processing import compute_lfp, compute_bua
-from dafn.xarray_utilities import replicate_dim
+from dafn.utilities import flexible_merge, ValidationError
+from pipeline_helper import checkpoint_xarray, checkpoint_json, checkpoint_excel, single
+
 from pathlib import Path
 import pandas as pd, numpy as np, xarray as xr
 import tqdm.auto as tqdm
@@ -15,7 +18,8 @@ import anyio
 import logging
 import h5py
 import beautifullogger
-from pipeline_helper import checkpoint_xarray, checkpoint_json, checkpoint_excel, single
+
+
 
 logger = logging.getLogger(__name__)
 beautifullogger.setup(displayLevel=logging.WARNING)
@@ -31,7 +35,7 @@ client= None
 
 spike2files_basefolder = Path("/media/julienb/T7 Shield/Revue-FRM/RawData/Rats/Version-RAW-2-Nico/")
 mat_basefolder = Path("/media/julienb/T7 Shield/Revue-FRM/RawData/Rats/Version-Matlab-Nico/")
-base_result_path = Path("/media/julienb/T7 Shield/Revue-FRM/AnalysisData/")
+base_result_path = Path("/media/julienb/T7 Shield/Revue-FRM/AnalysisData2/")
 
 def get_session_info():
     spike2files = list(spike2files_basefolder.glob("**/*.smr"))
@@ -48,133 +52,81 @@ def get_session_info():
     analysis_ds["mat_file"] = xr.where(analysis_ds["mat_file"].notnull(), analysis_ds["mat_file"].astype(str), np.nan)
     return analysis_ds
 
+error_groups = {}
+class AccepTableError(Exception): 
+    def __init__(self, group):
+        super().__init__(group)
+        if not group in error_groups:
+            error_groups[group] = tqdm.tqdm(desc=f"Error {group}")
+        error_groups[group].update(1)
+
+
+def get_channel_metadata(spike2_file, mat_file, mat_basefolder):
+    spike2_chans = smrxchanneldata(spike2_file)
+    mat_chans = get_mat_df(mat_file, mat_basefolder)
+    spike2_chans = spike2_chans.loc[spike2_chans["chan_type"].isin(["Adc", "EventRise"])]
+    try:
+        all_chans = flexible_merge(spike2_chans, mat_chans, "callable", lambda l, r: may_match(l, r, mat_basefolder, spike2_file), validation="1:1!", how="inner", suffixes=("", "_mat"))
+    except ValidationError:
+        return pd.DataFrame()
+    all_chans["chan_group"] = all_chans["chan_name"].str.lower().apply(rat_raw_chan_classification)
+    all_chans["chan_group"] = np.where(all_chans["physical_channel"]<0, "neuron", all_chans["chan_group"])
+    return all_chans
+
+def compute_initial_sigs(all_chans, spike2_file):
+    initial_sigs = get_initial_sigs(all_chans, spike2_file)
+    return initial_sigs
 
 async def process_rat_session(session_ds: xr.Dataset, session_index):
-    async with single(True):
+    from functools import partial
+    async with single(False):
         try:
             session_str = session_ds["session"].item()
             spike2_file = session_ds["spike2_file"].item()
+            mat_file = session_ds["mat_file"]
 
-            def get_rawchan_metadata():
-                all_chans = smrxchanneldata(spike2_file)
-                rawchan_metadata = all_chans.loc[all_chans["physical_channel"]>= 0].copy()
-                mat_df = get_mat_df(session_ds["mat_file"].sel(signal_type="raw", drop=True), mat_basefolder)
-                rawchan_metadata = rawchan_metadata.merge(mat_spike2_raw_join(mat_df, rawchan_metadata), on=rawchan_metadata.columns.tolist(), how="left")
-                return rawchan_metadata
             
-            rawchan_metadata = (await checkpoint_excel(get_rawchan_metadata, f"chan_metadata/{session_str}.xlsx", "chan_metadata", session_index))()
-            neuron_metadata = get_mat_df(session_ds["mat_file"].sel(signal_type="units", drop=True), mat_basefolder)
-            rawchan_metadata["chan_group"] = rawchan_metadata["chan_name"].str.lower().apply(rat_raw_chan_classification)
-            probe_chan_nums = rawchan_metadata["chan_num"].loc[(rawchan_metadata["chan_group"]=="Probe") & ~pd.isna(rawchan_metadata["structure"])].tolist()
-            ipsieeg_chan_nums = rawchan_metadata["chan_num"].loc[rawchan_metadata["chan_group"]=="EEGIpsi"].tolist()
 
-            if len(probe_chan_nums) == 0:
-                return None
-            start_t, end_t = (await checkpoint_json(lambda: extract_timing(rawchan_metadata, spike2_file, mat_basefolder),
-                                                f"timing/{session_str}.json", "timing", session_index))()
+            def compute_ffts(initial_sigs):
+                fft = compute_scaled_fft(initial_sigs).sel(f=slice(None, 120))
+                return fft
+
+            def compute_pwelch(ffts):
+                pwelch = (np.abs(ffts)**2).mean("t")
+                return pwelch
             
-            if start_t < 1:
-                return None
-
-            def compute_initial_sigs():
-                initial_sigs = {}
-                if len(probe_chan_nums) > 0:
-                    raw = smrxadc2electrophy(spike2_file, probe_chan_nums)
-                    initial_sigs["lfp"] = compute_lfp(raw).assign_coords(sig_type="lfp")
-                    initial_sigs["bua"] = compute_bua(raw).assign_coords(sig_type="bua")
-                if len(ipsieeg_chan_nums) == 1:
-                    initial_sigs["eeg"] = compute_lfp(smrxadc2electrophy(spike2_file, ipsieeg_chan_nums)).assign_coords(sig_type="eeg")
-                if len(neuron_metadata.index) > 0:
-                    print(session_index)
-                    import h5py
-                    print(start_t, end_t)
-                    print(session_ds)
-                    all_chans = smrxchanneldata(spike2_file)
-                    from rapidfuzz import process, fuzz
-                    neuron_metadata["real_mat_key"] = neuron_metadata["mat_key"]
-                    def get_fuzzy_match(k):
-                        fuz, score, _ = process.extractOne(k, [k for k in all_chans["chan_name"]], scorer=fuzz.WRatio) 
-                        # print(k,s score)
-                        if score > 80:
-                            return fuz
-                        return None
-                    
-                    neuron_metadata["mat_key"] = neuron_metadata["mat_key"].apply(get_fuzzy_match)
-                    print(mat_spike2_raw_join(neuron_metadata, all_chans))
-                    # print(neuron_metadata)
-                    # raise KeyboardInterrupt
-                    # print(initial_sigs["lfp"])
-                    all_ars = []
-                    for _, row in neuron_metadata.iterrows():
-                        with sonfile(spike2_file) as rec:
-                            time_base = rec.GetTimeBase()
-                            evs = np.array(rec.ReadEvents(int(row["chan_num"]), 10**7, 0))
-                            evs = evs*time_base
-
-                        with h5py.File(mat_basefolder / row["mat_path"], 'r') as f:
-                            a = np.array(f[row["real_mat_key"]]["times"][0])
-                            evs = evs[-a.size:]
-                            diff = np.diff(a)
-                            s_diff = np.diff(evs)
-
-                            if evs.shape != a.shape or (np.abs(diff - s_diff) > 10**-3).any() or np.abs(evs[0] - start_t - a[0]) > 10**-3:
-                                print(evs.shape, a.shape)
-                                print(evs[0] - start_t - a[0])
-                                print(start_t, a[0], evs[0])
-                                print(diff)
-                                print(s_diff)
-                                raise Exception("Problem")
-                                
-
-                            # print(row["mat_key"])
-                            # print(a[[1, -1]])
-                            # a+=start_t
-                            # index = np.round(a*1000).astype(int)
-                            # new_arr = np.zeros(initial_sigs["lfp"].sizes["t"], dtype=float)
-                            # np.add.at(new_arr, index, 1)
-                            # all_ars.append(new_arr)
-
-                    
-                    # raise KeyboardInterrupt
-                    # initial_sigs["spike"] = make_continuous(smrx2events(spike2_file, )initial_sigs["t"])
-                res = xr.concat([a for a in initial_sigs.values()], dim="channel").sel(t=slice(start_t, end_t))
-                return res
-
-            sig = await checkpoint_xarray(compute_initial_sigs, f"init_sig/{session_str}.zarr", "init_sig", session_index)
-            fft = await checkpoint_xarray(lambda: compute_scaled_fft(sig()).sel(f=slice(None, 120)), 
-                                        f"fft/{session_str}.zarr", f"fft", session_index)
-            
-            def add_metadata_to_array(a: xr.DataArray):
-                a = a.to_dataset(name="data")
-                a["chan_num"] = a["chan_num"].compute()
-                df = rawchan_metadata[["chan_group", "structure", "chan_num"]]
-                meta = df.to_xarray().rename(index="channel").set_coords(["chan_group", "structure", "chan_num"]).drop_vars("channel")
-                meta = meta.set_index(channel="chan_num")
-                meta = meta.reindex(channel=a["chan_num"])
-                a = xr.merge([a, meta], join="left")
-                a = a.drop_vars("channel")
-                return a["data"]
-            
-            def compute_welch():
-                a = fft()
-                a = add_metadata_to_array(a)
-                return (np.abs(a)**2).mean("t")
-            
-            def compute_coh():
-                a = fft()
-                a = add_metadata_to_array(a)
+            def compute_coh(ffts, all_chans):
+                all_chans_xr = all_chans.to_xarray()[["structure", "chan_num"]].set_coords(["chan_num", "structure"]).drop_vars("index")
+                all_chans_xr["structure"] = all_chans_xr["structure"].astype(str)
+                fft_merged = xr_merge(ffts.to_dataset(name="fft"), all_chans_xr, on="chan_num", how="left")["fft"]
                 def select(a1, a2):
-                    return ((a1["sig_type"] == "eeg") & (a2["sig_type"] != "eeg")) | ((a1["sig_type"] == a2["sig_type"]) & (a1["structure"] != a2["structure"]))
-                a1, a2 = replicate_dim(a, "channel", 2, select, "stacked", stacked_dim="channel_pair")
-                res = (a1*np.conj(a2)).mean("t")
-                return res
-            welch = await checkpoint_xarray(compute_welch, f"welch/{session_str}.zarr", f"welch", session_index)
-            coh = await checkpoint_xarray(compute_coh, f"coh/{session_str}.zarr", f"coh", session_index)
-            return welch, coh, rawchan_metadata  
+                    return ((a1["sig_type"] == "eeg") | (a2["sig_type"] == "eeg")) | ((a1["sig_type"] == a2["sig_type"]))
+
+                a1, a2 = replicate_dim(fft_merged, "channel", 2, select, "stacked", stacked_dim="channel_pair")
+                coh =chunk((a1*np.conj(a2)).mean("t"), channel_pair=1).reset_coords(["structure_1", "structure_2"], drop=True)
+                return coh
+
+            all_chans = (await checkpoint_excel(partial(get_channel_metadata, spike2_file, mat_file, mat_basefolder), 
+                                f"chan_metadata/{session_str}.xlsx", "chan_metadata", session_index, mode="process"))()
+            if all_chans.empty:
+                raise AccepTableError("No relevant data")
+            if all_chans.loc[all_chans["signal_type"]=="raw"].empty:
+                raise AccepTableError("No raw data")
+            
+            initial_sigs = (await checkpoint_xarray(partial(compute_initial_sigs, all_chans, spike2_file), 
+                            f"init_sig/{session_str}.zarr", "init_sig", session_index, mode="process"))
+            ffts =  (await checkpoint_xarray(lambda: compute_ffts(initial_sigs()), f"fft/{session_str}.zarr", "fft", session_index))
+            pwelch = (await checkpoint_xarray(lambda: compute_pwelch(ffts()), f"pwelch/{session_str}.zarr", "pwelch", session_index))
+            coh = (await checkpoint_xarray(lambda: compute_coh(ffts(), all_chans), f"coh/{session_str}.zarr", "coh", session_index))
+            return pwelch, coh, all_chans
+        except AccepTableError as e:
+            return None
         except Exception as e:
-            logger.exception("Error processing session")
+            logger.exception(f"Error processing session with index {session_index}")
+            raise
             return e
     
+
 async def process_sessions(analysis_ds: xr.Dataset):
     analysis_ds = analysis_ds
     # .isel(session=slice(0, 180))
@@ -243,4 +195,5 @@ async def main():
     print(analysis_ds)
     await process_sessions(analysis_ds)
 
-anyio.run(main, backend="trio")
+if __name__ == "__main__":
+    anyio.run(main, backend="trio")

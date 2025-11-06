@@ -5,8 +5,12 @@ import dask.array as da
 import anyio, shutil
 import heapq, json
 from contextlib import asynccontextmanager
-from typing import Callable, Awaitable, Any, TypeVar, List, Dict, Union
+from typing import Callable, Awaitable, Any, TypeVar, List, Dict, Union, Literal
 import logging
+import anyio.to_process
+import anyio.to_thread
+import functools
+import pickle
 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +65,8 @@ class Limiter:
                 event.set()
 
 groups = {}
-my_limiter = Limiter(10)
-base_result_path = Path("/media/julienb/T7 Shield/Revue-FRM/AnalysisData/")
+my_limiter = Limiter(5)
+base_result_path = Path("/media/julienb/T7 Shield/Revue-FRM/AnalysisData2/")
 
 def add_note_to_exception(exc, note):
     #Because we are currently using python 3.9 and we dont have add_note
@@ -71,8 +75,42 @@ def add_note_to_exception(exc, note):
     new_exc.__context__ = exc.__context__
     return new_exc
 
-T = TypeVar("T")
 
+def in_runner_func(func, tmp_path, save_fn):
+    res = func()
+    tmp_path.parent.mkdir(exist_ok=True, parents=True)
+    if tmp_path.exists():
+        if tmp_path.is_dir():
+            shutil.rmtree(tmp_path)
+        else:
+            tmp_path.unlink()
+    save_fn(res, tmp_path)
+
+from multiprocessing.reduction import ForkingPickler
+import io
+
+import multiprocessing as mp
+
+def _roundtrip_in_subprocess(data):
+    import pickle
+    pickle.loads(data)  # just try to unpickle
+    return True
+
+def test_anyio_picklable(obj):
+    buf = io.BytesIO()
+    ForkingPickler(buf).dump(obj)
+    data = buf.getvalue()
+
+    ctx = mp.get_context("spawn")  # AnyIO uses "spawn" by default
+    with ctx.Pool(1) as pool:
+        try:
+            pool.apply(_roundtrip_in_subprocess, (data,))
+            return True
+        except Exception as e:
+            print(f"❌ Not picklable for AnyIO: {type(e).__name__}: {e}")
+            raise
+
+T = TypeVar("T")
 def mk_checkpoint(
     save_fn: Callable[[T, Path], None],
     load_fn: Callable[[Path], T]
@@ -80,7 +118,7 @@ def mk_checkpoint(
     [Callable[[], T], Path, str, float],
     Awaitable[Callable[[], T]]
 ]:
-    async def checkpoint(func, path: Path, group: str, priority: float):
+    async def checkpoint(func, path: Path, group: str, priority: float, mode: Literal["thread", "process"] = "thread"):
         id = str(path)
         path = base_result_path/path
         #No need for thread safety, this should always be called from the main thread
@@ -95,17 +133,27 @@ def mk_checkpoint(
             async with my_limiter.get(priority):
                 groups[group][2]+=1
                 bar.set_postfix(dict(prev_done=groups[group][1], computing=groups[group][2]))
-                def mrun():
-                    res = func()
-                    tmp_path.parent.mkdir(exist_ok=True, parents=True)
-                    if tmp_path.exists():
-                        if tmp_path.is_dir():
-                            shutil.rmtree(tmp_path)
-                        else:
-                            tmp_path.unlink()
-                    save_fn(res, tmp_path)
+                mrun = functools.partial(in_runner_func, func, tmp_path, save_fn)
+                # if mode=="process":
+                #     try:
+                #         test_anyio_picklable(mrun)
+                #     except:
+                #         raise Exception("Not picklable")
+                    # raise Exception("Stop")
+                # def mrun():
+                #     res = func()
+                #     tmp_path.parent.mkdir(exist_ok=True, parents=True)
+                #     if tmp_path.exists():
+                #         if tmp_path.is_dir():
+                #             shutil.rmtree(tmp_path)
+                #         else:
+                #             tmp_path.unlink()
+                #     save_fn(res, tmp_path)
                 try:
-                    await anyio.to_thread.run_sync(mrun)
+                    if mode == "thread":
+                        await anyio.to_thread.run_sync(mrun)
+                    elif mode=="process":
+                        await anyio.to_process.run_sync(mrun)
                 except Exception as e:
                     logger.exception(f"While computing {id}")
                     raise add_note_to_exception(e, f"While computing {id}")
