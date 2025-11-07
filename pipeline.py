@@ -1,4 +1,5 @@
 from json import load
+from os import error
 import anyio.to_thread
 # from dafn.dask_helper import checkpoint_xra_zarr, checkpoint_xrds_zarr, checkpoint_delayed
 from dafn.xarray_utilities import xr_merge, chunk, replicate_dim
@@ -7,7 +8,7 @@ from dafn.signal_processing import compute_bua, compute_lfp, compute_scaled_fft
 from dafn.spike2 import smrxadc2electrophy, smrxchanneldata, sonfile
 from dafn.signal_processing import compute_lfp, compute_bua
 from dafn.utilities import flexible_merge, ValidationError
-from pipeline_helper import checkpoint_xarray, checkpoint_json, checkpoint_excel, single
+from pipeline_helper import checkpoint_xarray, checkpoint_json, checkpoint_excel, single, add_note_to_exception, set_limiter, set_base_result_path
 
 from pathlib import Path
 import pandas as pd, numpy as np, xarray as xr
@@ -19,7 +20,8 @@ import logging
 import h5py
 import beautifullogger
 
-
+print = lambda a: tqdm.tqdm.write(str(a))
+xr.set_options(display_max_rows=100)
 
 logger = logging.getLogger(__name__)
 beautifullogger.setup(displayLevel=logging.WARNING)
@@ -35,10 +37,12 @@ client= None
 
 spike2files_basefolder = Path("/media/julienb/T7 Shield/Revue-FRM/RawData/Rats/Version-RAW-2-Nico/")
 mat_basefolder = Path("/media/julienb/T7 Shield/Revue-FRM/RawData/Rats/Version-Matlab-Nico/")
-base_result_path = Path("/media/julienb/T7 Shield/Revue-FRM/AnalysisData2/")
+base_result_path = Path("/media/julienb/T7 Shield/Revue-FRM/AnalysisData3/")
+set_base_result_path(base_result_path)
+set_limiter(5)
 
 def get_session_info():
-    spike2files = list(spike2files_basefolder.glob("**/*.smr"))
+    spike2files = [p for p in spike2files_basefolder.glob("**/*.smr") if not "Events files" in str(p)]
     spike2df = get_smrx_metadata([p.relative_to(spike2files_basefolder) for p in spike2files])
     mat_files = list(mat_basefolder.glob("**/*.mat"))
     mat_df = get_matfile_metadata([p.relative_to(mat_basefolder) for p in mat_files])
@@ -50,6 +54,7 @@ def get_session_info():
     analysis_ds["session"] = xr.apply_ufunc(lambda p: str(Path(p).with_suffix("")).replace("/", "--"), analysis_ds["spike2_file"], vectorize=True)
     analysis_ds["spike2_file"] = str(spike2files_basefolder) + "/"+ analysis_ds["spike2_file"].astype(str)
     analysis_ds["mat_file"] = xr.where(analysis_ds["mat_file"].notnull(), analysis_ds["mat_file"].astype(str), np.nan)
+    analysis_ds["subject"] = analysis_ds["subject"].astype(str)
     return analysis_ds
 
 error_groups = {}
@@ -57,8 +62,9 @@ class AccepTableError(Exception):
     def __init__(self, group):
         super().__init__(group)
         if not group in error_groups:
-            error_groups[group] = tqdm.tqdm(desc=f"Error {group}")
+            error_groups[group] = tqdm.tqdm(desc=f"Error {group}", leave=False)
         error_groups[group].update(1)
+        error_groups[group].refresh()
 
 
 def get_channel_metadata(spike2_file, mat_file, mat_basefolder):
@@ -66,11 +72,22 @@ def get_channel_metadata(spike2_file, mat_file, mat_basefolder):
     mat_chans = get_mat_df(mat_file, mat_basefolder)
     spike2_chans = spike2_chans.loc[spike2_chans["chan_type"].isin(["Adc", "EventRise"])]
     try:
-        all_chans = flexible_merge(spike2_chans, mat_chans, "callable", lambda l, r: may_match(l, r, mat_basefolder, spike2_file), validation="1:1!", how="inner", suffixes=("", "_mat"))
-    except ValidationError:
-        return pd.DataFrame()
-    all_chans["chan_group"] = all_chans["chan_name"].str.lower().apply(rat_raw_chan_classification)
-    all_chans["chan_group"] = np.where(all_chans["physical_channel"]<0, "neuron", all_chans["chan_group"])
+        if mat_chans.empty:
+            raise AccepTableError("No mat data")
+        if spike2_chans.loc[spike2_chans["physical_channel"]>=0].empty:
+            raise AccepTableError("No raw data in spike2 file")
+        try:
+            all_chans = flexible_merge(spike2_chans, mat_chans, "callable", lambda l, r: may_match(l, r, mat_basefolder, spike2_file), validation="1:1!", how="inner", suffixes=("", "_mat"))
+        except ValidationError:
+            raise AccepTableError("Not 1:1! merge...")
+        all_chans["chan_group"] = all_chans["chan_name"].str.lower().apply(rat_raw_chan_classification)
+        all_chans["chan_group"] = np.where(all_chans["physical_channel"]<0, "neuron", all_chans["chan_group"])
+        if all_chans.loc[all_chans["signal_type"]=="raw"].empty:
+            raise AccepTableError("No raw data after merge")
+    except AccepTableError as e:
+        error_df = pd.DataFrame()
+        error_df["__error__"] = [e.args[0]]
+        return error_df
     return all_chans
 
 def compute_initial_sigs(all_chans, spike2_file):
@@ -101,17 +118,15 @@ async def process_rat_session(session_ds: xr.Dataset, session_index):
                 fft_merged = xr_merge(ffts.to_dataset(name="fft"), all_chans_xr, on="chan_num", how="left")["fft"]
                 def select(a1, a2):
                     return ((a1["sig_type"] == "eeg") | (a2["sig_type"] == "eeg")) | ((a1["sig_type"] == a2["sig_type"]))
-
                 a1, a2 = replicate_dim(fft_merged, "channel", 2, select, "stacked", stacked_dim="channel_pair")
                 coh =chunk((a1*np.conj(a2)).mean("t"), channel_pair=1).reset_coords(["structure_1", "structure_2"], drop=True)
                 return coh
 
             all_chans = (await checkpoint_excel(partial(get_channel_metadata, spike2_file, mat_file, mat_basefolder), 
                                 f"chan_metadata/{session_str}.xlsx", "chan_metadata", session_index, mode="process"))()
-            if all_chans.empty:
-                raise AccepTableError("No relevant data")
-            if all_chans.loc[all_chans["signal_type"]=="raw"].empty:
-                raise AccepTableError("No raw data")
+            
+            if "__error__" in all_chans.columns:
+                raise AccepTableError(all_chans["__error__"].iat[0])
             
             initial_sigs = (await checkpoint_xarray(partial(compute_initial_sigs, all_chans, spike2_file), 
                             f"init_sig/{session_str}.zarr", "init_sig", session_index, mode="process"))
@@ -122,43 +137,149 @@ async def process_rat_session(session_ds: xr.Dataset, session_index):
         except AccepTableError as e:
             return None
         except Exception as e:
-            logger.exception(f"Error processing session with index {session_index}")
+            add_note_to_exception(e, f"While processing session with index {session_index}")
             raise
-            return e
     
+
+def compute_neuron_type(meta, eeg, delta_t, duration, spike2_file):
+    from pipeline_fct.rats import get_probe_data
+    eeg_sig = get_probe_data(eeg, delta_t, duration, spike2_file).isel(channel=0).compute()
+    neuron_types = []
+    with sonfile(spike2_file) as rec:
+        time_base = rec.GetTimeBase()
+        for _, row in meta.loc[(meta["chan_group"] == "neuron") & (meta["structure"] == "GPe")].iterrows():
+            chan = int(row["chan_num"])
+            spike_times = np.array(rec.ReadEvents(chan, 10**7, int(delta_t/time_base), int((delta_t+duration)/time_base)))*time_base
+            values = eeg_sig.interp(t=spike_times)
+            proportion = (values.sum()/np.abs(values).sum()).item()
+            neuron_types.append(dict(chan_num=chan, proportion=proportion))
+    return pd.DataFrame(neuron_types)
+
+async def process_neuron_types(session_ds, meta: pd.DataFrame, session_index):
+    from functools import partial
+    try:
+        spike2_file = session_ds["spike2_file"].item()
+        session_str = session_ds["session"].item()
+
+        meta = meta.loc[meta["chan_group"].isin(["EEGIpsi", "neuron"])]
+        delta_t = meta["delta_t"].max()
+        duration = meta["common_duration"].min()
+        eeg = meta.loc[meta["chan_group"]=="EEGIpsi"]
+        if eeg.empty:
+            raise AccepTableError("No eeg data in swa session")
+        elif len(eeg.index) > 1:
+            raise Exception("More than one eeg signal...")
+        
+        res =  (await checkpoint_excel(partial(compute_neuron_type, meta, eeg, delta_t, duration, spike2_file), 
+                                f"neuron_type/{session_str}.xlsx", "neuron_type", session_index, mode="process"))()
+        if res.empty:
+            raise AccepTableError("No GPe neurons in swa session")
+        res = pd.merge(res, meta[["chan_num", "chan_name", "mat_key"]], how="left", on="chan_num")
+        return res[["proportion", "chan_name"]]
+    except AccepTableError as e:
+        return None
+    except Exception as e:
+        add_note_to_exception(e, f"While processing neuron types on session with index {session_index}")
+        raise
 
 async def process_sessions(analysis_ds: xr.Dataset):
     analysis_ds = analysis_ds
-    # .isel(session=slice(0, 180))
     results = {}
-    errors = []
+    neuron_types = {}
+
     async def add_session_result(session_ds, session_index):
-            result =  await process_rat_session(session_ds, session_index)
-            if isinstance(result, Exception):
-                errors.append(result)
-            elif result:
-                results[session_index] = result
+        result =  await process_rat_session(session_ds, session_index)
+        if result:
+            results[session_index] = result
+
+    async def add_neuron_types(session_ds, meta, session_index):
+        grp = (session_ds["subject"].item(), session_ds["session_grp"].item())
+        if not grp in neuron_types:
+            neuron_types[grp] = session_index
+        else:
+            raise Exception(f"Multiple swa session for group {grp}, got {neuron_types[grp]} {session_index}")
+        result =  await process_neuron_types(session_ds, meta, session_index)
+        if result is not None:
+            neuron_types[grp] = result
+        else:
+            del neuron_types[grp]
             
     async with anyio.create_task_group() as tg:
         for s in range(analysis_ds.sizes["session"]):
             ds = analysis_ds.isel(session=s)
             tg.start_soon(add_session_result, ds, s)
             await anyio.sleep(0)
-    print(f"#sessions with errors {len(errors)}.")
-    for er in errors:
-        print(er)
-    print(f"Got {len(results)} valid results")
-    session_metadata_cols = ["condition", "has_swa", "is_APO", "session_grp", "subject", "session"]
 
+    async with anyio.create_task_group() as tg:
+        for k, (_, _, meta) in results.items():
+            session_ds = analysis_ds.isel(session=k)
+            if session_ds["has_swa"] == 1:
+                tg.start_soon(add_neuron_types, session_ds, meta, k)
+                await anyio.sleep(0)
+
+
+    def combine_welch():
+        all = []
+        for k, (a, _, meta) in results.items():
+            ar: xr.DataArray = a().compute().assign_coords(session_index=k)
+            all.append(ar)
+        res = xr.concat(all, dim="channel")
+        return res
+    
+    def combine_coherence():
+        all = []
+        for k, (_, a, meta) in results.items():
+            ar: xr.DataArray = a().compute().assign_coords(session_index=k)
+            all.append(ar)
+        res = xr.concat(all, dim="channel_pair")
+        return res
+    
+    def combine_meta():
+        all = []
+        for k, (_, _, meta) in results.items():
+            ar: xr.Dataset = meta.to_xarray()
+            ar = ar.drop_vars(["index"]+[c for c in ar.data_vars if "unnamed" in c.lower()])
+            ar = ar.set_coords(ar.data_vars).assign_coords(session_index=k)
+            all.append(ar)
+        res = xr.concat(all, dim="index")
+        return res
+    
+    def combine_neuron_types():
+        all = []
+        for (subject, sgrp), nt in neuron_types.items():
+            ar: xr.Dataset = nt.to_xarray()
+            ar = ar.drop_vars(["index"])
+            ar = ar.set_coords(ar.data_vars).assign_coords(subject=subject, session_grp=sgrp)
+            all.append(ar)
+        res = xr.concat(all, dim="index")
+        return res
+
+    
+    all_welch = (await checkpoint_xarray(combine_welch, f"combined_welch.zarr", f"combined_welch", 0))()
+    all_coh = (await checkpoint_xarray(combine_coherence, f"combined_coh.zarr", f"combined_coh", 0))()
+    all_meta = (await checkpoint_xarray(combine_meta, f"combined_meta.zarr", f"combined_meta", 0))()
+    all_meta = (await checkpoint_xarray(combine_neuron_types, f"combined_nt.zarr", f"combined_nt", 0))()
+
+    raise Exception("Stop")
+    return all_welch, all_coh, all_meta, neuron_types
+
+    session_metadata_cols = ["condition", "has_swa", "is_APO", "session_grp", "subject", "session"]
     def combine_welch():
         welchs = []
         for k, (w, _, meta) in results.items():
             ar: xr.DataArray = w().compute()
             session_ds = analysis_ds.isel(session=k)
             session_info = {k:session_ds[k].item() for k in session_metadata_cols}
+            meta_xr = meta.to_xarray()[["structure", "chan_num", "chan_name", "mat_key"]].set_coords(["chan_num", "structure", "chan_name", "mat_key"]).drop_vars("index")
+            meta_xr["structure"] = meta_xr["structure"].astype(str)
+            ar = xr_merge(ar.to_dataset(name="pwelch"), meta_xr, on="chan_num", how="left")["pwelch"]
             ar = ar.assign_coords(session_info)
             welchs.append(ar)
-        res = xr.concat(welchs, dim="channel").compute()
+        res = xr.concat(welchs, dim="channel")
+        print(res)
+        res = xr_merge(res.to_dataset(name="pwelch"), neuron_types_concatenated, 
+                       on=["session_grp", "subject", "chan_name"], how="left").set_coords("proportion")["pwelch"]
+        res["has_swa"] = res["has_swa"].astype(bool)
         return res
     
     def combine_coherence():
@@ -167,22 +288,45 @@ async def process_sessions(analysis_ds: xr.Dataset):
             ar: xr.DataArray = coh().compute()
             session_ds = analysis_ds.isel(session=k)
             session_info = {k:session_ds[k].item() for k in session_metadata_cols}
+            meta_xr: xr.Dataset = meta.to_xarray()[["structure", "chan_num", "chan_name", "mat_key"]].set_coords(["chan_num", "structure", "chan_name", "mat_key"]).drop_vars("index")
+            meta_xr["structure"] = meta_xr["structure"].astype(str)
+            for suffix in ["_1", "_2"]:
+                ar = xr_merge(ar.to_dataset(name="coh"), meta_xr.rename({k: k+suffix for k in ["structure", "chan_num", "chan_name", "mat_key"]}), 
+                              on="chan_num"+suffix, how="left")["coh"]
             ar = ar.assign_coords(session_info)
             coherence.append(ar)
         res = xr.concat(coherence, dim="channel_pair").compute()
-        print("Storing to zarr")
+        for suffix in ["_1", "_2"]:
+            size = res.sizes
+            res = xr_merge(res.to_dataset(name="coh"), neuron_types_concatenated.rename({k: k+suffix for k in ["chan_name", "proportion", "neuron_subtype"]}), 
+                       on=["session_grp", "subject", "chan_name"+suffix], how="left").set_coords("proportion"+suffix)["coh"]
+            if res.sizes != size:
+                raise Exception("Problem")
+        res["has_swa"] = res["has_swa"].astype(bool)
         return res
     
-    all_welch = (await checkpoint_xarray(combine_welch, f"all_welch.zarr", f"all_welch", 0))()
-    all_coh = (await checkpoint_xarray(combine_coherence, f"all_coh.zarr", f"all_coh", 0))()
-
+    def welch_metadata():
+        welch: xr.DataArray = all_welch()
+        return welch.to_dataset(name="welch").drop_dims("f").to_dataframe().reset_index(drop=True)
+    
+    def coh_metadata():
+        coh: xr.DataArray = all_coh()
+        return coh.to_dataset(name="coh").drop_dims("f").to_dataframe().reset_index(drop=True)
     
 
-    # print(welchs[0]().compute())
-    # print(chan_metadatas[0])
-    # all_welch = await checkpoint_xra_zarr(xr.concat(welchs, dim="channel"), base_result_path/f"all_welch.zarr", client)
-    # all_coh = await checkpoint_xra_zarr(xr.concat(cohs, dim="channel"), base_result_path/f"all_coh.zarr", client)
-    # return all_welch, all_coh
+    neuron_types_coords = ["session_grp", "subject", "chan_name", "proportion"]
+    neuron_types_concatenated = (pd.concat([df.assign(subject=k[0], session_grp=k[1]) for k, df in neuron_types.items()]).to_xarray()
+                                 .drop_vars("index")[neuron_types_coords].set_coords(neuron_types_coords)
+    )
+    neuron_types_concatenated = neuron_types_concatenated.assign_coords(neuron_subtype = xr.where(
+        neuron_types_concatenated["proportion"] > 0.1, "Arky", xr.where(neuron_types_concatenated["proportion"] < -0.1, "Proto", "")))
+
+
+    all_welch = (await checkpoint_xarray(combine_welch, f"all_welch.zarr", f"all_welch", 0))
+    all_welch_meta = (await checkpoint_excel(welch_metadata, f"welch_metadata.xlsx", f"welch_metadata", 0))
+    all_coh = (await checkpoint_xarray(combine_coherence, f"all_coh.zarr", f"all_coh", 0))
+    all_coh_meta = (await checkpoint_excel(coh_metadata, f"coh_metadata.xlsx", f"coh_metadata", 0))
+
 
 async def main():
     analysis_ds: xr.Dataset = (await checkpoint_xarray(
@@ -193,7 +337,7 @@ async def main():
     analysis_ds = analysis_ds.sortby("session")
     logger.info("got analysis ds")
     print(analysis_ds)
-    await process_sessions(analysis_ds)
+    all_welch, all_coh, all_meta, neuron_types = await process_sessions(analysis_ds)
 
 if __name__ == "__main__":
     anyio.run(main, backend="trio")

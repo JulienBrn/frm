@@ -66,7 +66,16 @@ class Limiter:
 
 groups = {}
 my_limiter = Limiter(5)
-base_result_path = Path("/media/julienb/T7 Shield/Revue-FRM/AnalysisData2/")
+base_result_path: Path = None
+# Path("/media/julienb/T7 Shield/Revue-FRM/AnalysisData2/")
+
+def set_limiter(limit: 5):
+    global my_limiter
+    my_limiter = Limiter(limit)
+
+def set_base_result_path(p: Path):
+    global base_result_path
+    base_result_path = Path(p)
 
 def add_note_to_exception(exc, note):
     #Because we are currently using python 3.9 and we dont have add_note
@@ -134,28 +143,13 @@ def mk_checkpoint(
                 groups[group][2]+=1
                 bar.set_postfix(dict(prev_done=groups[group][1], computing=groups[group][2]))
                 mrun = functools.partial(in_runner_func, func, tmp_path, save_fn)
-                # if mode=="process":
-                #     try:
-                #         test_anyio_picklable(mrun)
-                #     except:
-                #         raise Exception("Not picklable")
-                    # raise Exception("Stop")
-                # def mrun():
-                #     res = func()
-                #     tmp_path.parent.mkdir(exist_ok=True, parents=True)
-                #     if tmp_path.exists():
-                #         if tmp_path.is_dir():
-                #             shutil.rmtree(tmp_path)
-                #         else:
-                #             tmp_path.unlink()
-                #     save_fn(res, tmp_path)
                 try:
                     if mode == "thread":
                         await anyio.to_thread.run_sync(mrun)
                     elif mode=="process":
                         await anyio.to_process.run_sync(mrun)
                 except Exception as e:
-                    logger.exception(f"While computing {id}")
+                    # logger.exception(f"While computing {id}")
                     raise add_note_to_exception(e, f"While computing {id}")
                 finally:
                     groups[group][2]-=1
@@ -171,8 +165,8 @@ def mk_checkpoint(
 
 def _load_xarray(path: Path) -> Union[xr.DataArray, xr.Dataset]: 
     obj = xr.open_zarr(path)
-    if not obj:
-        raise Exception("Load result is None...")
+    # if  obj:
+    #     raise Exception("Load result is None...")
     for k in list(obj.data_vars) + list(obj.coords):
         o: xr.Dataset = obj[k]
         if obj[k].attrs.pop("__computed_"):
@@ -194,11 +188,18 @@ def _save_xarray(obj: Union[xr.DataArray, xr.Dataset], path: Path):
         obj.attrs["_is_xrdatarray_"] = True
     else:
         obj.attrs["_is_xrdatarray_"] = False
+    obj:xr.Dataset
+    encoding = {}
     for k in list(obj.data_vars) + list(obj.coords):
-        obj[k].attrs["__computed_"] = not isinstance(obj[k].data, da.Array)
+        ar: xr.DataArray = obj[k]
+        is_computed = not isinstance(ar.data, da.Array)
+        obj[k].attrs["__computed_"] = is_computed
         obj[k].encoding.pop("filters", None)
-    obj.to_zarr(path, compute=True)
-
+        encoding[k] = {"compressor": None, "chunks": ar.shape if is_computed else ar.data.chunksize}
+    # import time
+    # start = time.time()
+    obj.to_zarr(path, compute=True, encoding=encoding)#compute=True doesnt do anything on non chunked arrays
+    # print(f"duration={time.time()-start}s")
 
 checkpoint_xarray = mk_checkpoint(_save_xarray, _load_xarray)
 
