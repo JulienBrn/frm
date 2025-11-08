@@ -94,9 +94,6 @@ def get_channel_metadata(spike2_file, mat_file, mat_basefolder):
         return error_df
     return all_chans
 
-def compute_initial_sigs(all_chans, spike2_file):
-    initial_sigs = get_initial_sigs(all_chans, spike2_file)
-    return initial_sigs
 
 async def process_rat_session(session_ds: xr.Dataset, session_index):
     from functools import partial
@@ -135,7 +132,7 @@ async def process_rat_session(session_ds: xr.Dataset, session_index):
             all_chans["chan_name_normalized"] = all_chans["chan_name"].str.translate(str.maketrans('', '', "_-/ "))
             if all_chans["chan_name_normalized"].duplicated().any():
                 raise Exception("Not unique normalized names...")
-            initial_sigs = (await checkpoint_xarray(partial(compute_initial_sigs, all_chans, spike2_file), 
+            initial_sigs = (await checkpoint_xarray(partial(get_initial_sigs, all_chans, spike2_file), 
                             f"init_sig/{session_str}.zarr", "init_sig", session_index, mode="process"))
             ffts =  (await checkpoint_xarray(lambda: compute_ffts(initial_sigs()), f"fft/{session_str}.zarr", "fft", session_index))
             pwelch = (await checkpoint_xarray(lambda: compute_pwelch(ffts()), f"pwelch/{session_str}.zarr", "pwelch", session_index))
