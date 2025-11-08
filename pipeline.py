@@ -1,6 +1,7 @@
 from json import load
 from os import error
 import anyio.to_thread
+from requests import session
 # from dafn.dask_helper import checkpoint_xra_zarr, checkpoint_xrds_zarr, checkpoint_delayed
 from dafn.xarray_utilities import xr_merge, chunk, replicate_dim
 from pipeline_fct.rats import get_matfile_metadata, get_smrx_metadata, rat_raw_chan_classification, get_mat_df, get_initial_sigs, may_match
@@ -19,6 +20,7 @@ import anyio
 import logging
 import h5py
 import beautifullogger
+from typing import Tuple
 
 print = lambda a: tqdm.tqdm.write(str(a))
 xr.set_options(display_max_rows=100)
@@ -122,12 +124,15 @@ async def process_rat_session(session_ds: xr.Dataset, session_index):
                 coh =chunk((a1*np.conj(a2)).mean("t"), channel_pair=1).reset_coords(["structure_1", "structure_2"], drop=True)
                 return coh
 
-            all_chans = (await checkpoint_excel(partial(get_channel_metadata, spike2_file, mat_file, mat_basefolder), 
+            all_chans: pd.DataFrame = (await checkpoint_excel(partial(get_channel_metadata, spike2_file, mat_file, mat_basefolder), 
                                 f"chan_metadata/{session_str}.xlsx", "chan_metadata", session_index, mode="process"))()
             
             if "__error__" in all_chans.columns:
                 raise AccepTableError(all_chans["__error__"].iat[0])
             
+            all_chans["chan_name_normalized"] = all_chans["chan_name"].str.translate(str.maketrans('', '', "_-/ "))
+            if all_chans["chan_name_normalized"].duplicated().any():
+                raise Exception("Not unique normalized names...")
             initial_sigs = (await checkpoint_xarray(partial(compute_initial_sigs, all_chans, spike2_file), 
                             f"init_sig/{session_str}.zarr", "init_sig", session_index, mode="process"))
             ffts =  (await checkpoint_xarray(lambda: compute_ffts(initial_sigs()), f"fft/{session_str}.zarr", "fft", session_index))
@@ -174,15 +179,15 @@ async def process_neuron_types(session_ds, meta: pd.DataFrame, session_index):
                                 f"neuron_type/{session_str}.xlsx", "neuron_type", session_index, mode="process"))()
         if res.empty:
             raise AccepTableError("No GPe neurons in swa session")
-        res = pd.merge(res, meta[["chan_num", "chan_name", "mat_key"]], how="left", on="chan_num")
-        return res[["proportion", "chan_name"]]
+        res = pd.merge(res, meta[["chan_num", "chan_name_normalized", "mat_key"]], how="left", on="chan_num")
+        return res[["proportion", "chan_name_normalized"]]
     except AccepTableError as e:
         return None
     except Exception as e:
         add_note_to_exception(e, f"While processing neuron types on session with index {session_index}")
         raise
 
-async def process_sessions(analysis_ds: xr.Dataset):
+async def get_rats_combined_data(analysis_ds: xr.Dataset) -> Tuple[xr.DataArray, xr.DataArray, xr.Dataset, xr.Dataset]:
     analysis_ds = analysis_ds
     results = {}
     neuron_types = {}
@@ -258,10 +263,9 @@ async def process_sessions(analysis_ds: xr.Dataset):
     all_welch = (await checkpoint_xarray(combine_welch, f"combined_welch.zarr", f"combined_welch", 0))()
     all_coh = (await checkpoint_xarray(combine_coherence, f"combined_coh.zarr", f"combined_coh", 0))()
     all_meta = (await checkpoint_xarray(combine_meta, f"combined_meta.zarr", f"combined_meta", 0))()
-    all_meta = (await checkpoint_xarray(combine_neuron_types, f"combined_nt.zarr", f"combined_nt", 0))()
+    all_nt = (await checkpoint_xarray(combine_neuron_types, f"combined_nt.zarr", f"combined_nt", 0))()
 
-    raise Exception("Stop")
-    return all_welch, all_coh, all_meta, neuron_types
+    return all_welch, all_coh, all_meta, all_nt
 
     session_metadata_cols = ["condition", "has_swa", "is_APO", "session_grp", "subject", "session"]
     def combine_welch():
@@ -328,16 +332,39 @@ async def process_sessions(analysis_ds: xr.Dataset):
     all_coh_meta = (await checkpoint_excel(coh_metadata, f"coh_metadata.xlsx", f"coh_metadata", 0))
 
 
+async def process_rats_data(analysis_ds):
+    all_welch, all_coh, all_meta, neuron_types = await get_rats_combined_data(analysis_ds)
+    neuron_types = neuron_types.assign_coords(neuron_type = xr.where(
+        neuron_types["proportion"] > 0.1, "Arky", xr.where(neuron_types["proportion"] < -0.1, "Proto", "")))
+    channel_metadata = xr_merge(all_meta, analysis_ds.drop_dims(["signal_type", "structure"]), how="left", on=["session_index"])
+    channel_metadata = xr_merge(channel_metadata, neuron_types, how="left", on=["session_grp", "subject", "chan_name_normalized"])
+    channel_metadata["has_swa"] = channel_metadata["has_swa"].astype(bool)
+    channel_metadata.to_dataframe().reset_index(drop=True).to_excel(base_result_path/"rat_metadata.xlsx", index=False)
+    session_columns = ["subject", "session_index", "session", "condition", "has_swa", "is_APO"]
+    channel_columns = ["structure", "neuron_type", "chan_name", "chan_num"]
+    channel_metadata = channel_metadata.reset_coords()
+    all_welch = xr_merge(all_welch.to_dataset(name="pwelch").reset_coords(), channel_metadata[channel_columns + session_columns], 
+                         how="left", on=["session_index", "chan_num"])
+    all_coh = all_coh.to_dataset(name="coh").reset_coords()
+    for suffix in ["_1", "_2"]:
+        all_coh = xr_merge(all_coh, channel_metadata[session_columns+channel_columns].rename({k:k+suffix for k in channel_columns}).set_coords([k for k in session_columns if not k=="session_index"]), 
+                           how="left", on=["session_index", "chan_num"+suffix])
+    all_welch = all_welch.set_coords([c for c in all_welch.data_vars if not c=="pwelch"])["pwelch"]
+    all_coh = all_coh.set_coords([c for c in all_coh.data_vars if not c=="coh"])["coh"]
+    return all_welch, all_coh
+
 async def main():
     analysis_ds: xr.Dataset = (await checkpoint_xarray(
         get_session_info, 
         "analysis_files.zarr", 
         "files", 0
     ))()
-    analysis_ds = analysis_ds.sortby("session")
+    analysis_ds = analysis_ds.sortby("session").assign_coords(session_index=("session", np.arange(analysis_ds.sizes["session"]))).set_coords(analysis_ds.data_vars)
     logger.info("got analysis ds")
     print(analysis_ds)
-    all_welch, all_coh, all_meta, neuron_types = await process_sessions(analysis_ds)
+    rat_welch, rat_coh = await process_rats_data(analysis_ds)
+    print(rat_welch)
+    print(rat_coh)
 
 if __name__ == "__main__":
     anyio.run(main, backend="trio")
