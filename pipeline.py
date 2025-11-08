@@ -40,8 +40,19 @@ client= None
 spike2files_basefolder = Path("/media/julienb/T7 Shield/Revue-FRM/RawData/Rats/Version-RAW-2-Nico/")
 mat_basefolder = Path("/media/julienb/T7 Shield/Revue-FRM/RawData/Rats/Version-Matlab-Nico/")
 base_result_path = Path("/media/julienb/T7 Shield/Revue-FRM/AnalysisData3/")
+
 set_base_result_path(base_result_path)
 set_limiter(5)
+error_groups = {}
+class AccepTableError(Exception): 
+    def __init__(self, group):
+        super().__init__(group)
+        if not group in error_groups:
+            error_groups[group] = tqdm.tqdm(desc=f"Error {group}", leave=False)
+        error_groups[group].update(1)
+        error_groups[group].refresh()
+
+
 
 def get_session_info():
     spike2files = [p for p in spike2files_basefolder.glob("**/*.smr") if not "Events files" in str(p)]
@@ -58,15 +69,6 @@ def get_session_info():
     analysis_ds["mat_file"] = xr.where(analysis_ds["mat_file"].notnull(), analysis_ds["mat_file"].astype(str), np.nan)
     analysis_ds["subject"] = analysis_ds["subject"].astype(str)
     return analysis_ds
-
-error_groups = {}
-class AccepTableError(Exception): 
-    def __init__(self, group):
-        super().__init__(group)
-        if not group in error_groups:
-            error_groups[group] = tqdm.tqdm(desc=f"Error {group}", leave=False)
-        error_groups[group].update(1)
-        error_groups[group].refresh()
 
 
 def get_channel_metadata(spike2_file, mat_file, mat_basefolder):
