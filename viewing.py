@@ -125,29 +125,4 @@ for st in ["bua", "neuron"]:
   fig.write_html(f"coh_phase_{st}.html", config=plotly_config)
 
 
-# %%
-
-# coh = coh.assign_coords(nsigs=n_sigs)
-# coh = coh.where(coh["nsigs"]>20, drop=True)
-# coh["power"] = coh["power"]/coh["power"].groupby(groups).mean()
-
-# coh["count"] = xr.ones_like(coh["power"])
-# phase_density = coh.groupby(dict(phase=xr.groupers.BinGrouper(np.linspace(0, 360, 13)), power=xr.groupers.BinGrouper(bins=8)) 
-#                             | {k: xr.groupers.UniqueGrouper() for k in groups}).sum()
-# phase_density["count"] =  phase_density["count"]/phase_density["count"].sum(["phase_bins", "power_bins"])
-# phase_density["phase_bins"] = [x.mid for x in phase_density["phase_bins"].data]
-# phase_density["power_bins"] = [x.right for x in phase_density["power_bins"].data]
-# phase_density = phase_density.assign_coords(nsigs=n_sigs)
-# phase_density
-
-
-# %%
-# from dafn.plot_utilities import faceted_imshow_xarray
-# ar = 1*((phase_density["count"]).sel(sig_type_1="bua", sig_type_2="bua", is_APO=False, condition="Park").fillna(0))
-# ar = ar.where(ar["nsigs"]>20, drop=True)
-# ar = ar.where((ar > 0).any(["phase_bins"]), drop=True)
-# # ar = ar.fillna(0)
-# fig = faceted_imshow_xarray(ar, r_dim="power_bins", theta_dim="phase_bins", facet_row="structure_2",facet_col="structure_1", subplot_width=250, subplot_height=250)
-# fig.show(config=plotly_config)
-
 
