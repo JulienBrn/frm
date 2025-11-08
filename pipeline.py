@@ -289,11 +289,7 @@ async def process_rats_data(analysis_ds):
     return all_welch, all_coh
 
 async def main():
-    analysis_ds: xr.Dataset = (await checkpoint_xarray(
-        get_session_info, 
-        "analysis_files.zarr", 
-        "files", 0
-    ))()
+    analysis_ds: xr.Dataset = (await checkpoint_xarray(get_session_info, "analysis_files.zarr",  "files", 0))()
     analysis_ds = analysis_ds.sortby("session").assign_coords(session_index=("session", np.arange(analysis_ds.sizes["session"]))).set_coords(analysis_ds.data_vars)
     logger.info("got analysis ds")
     print(analysis_ds)
