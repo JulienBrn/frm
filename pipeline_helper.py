@@ -198,7 +198,7 @@ def _save_xarray(obj: Union[xr.DataArray, xr.Dataset], path: Path):
         encoding[k] = {"compressor": None, "chunks": ar.shape if is_computed else ar.data.chunksize}
     # import time
     # start = time.time()
-    obj.to_zarr(path, compute=True, encoding=encoding)#compute=True doesnt do anything on non chunked arrays
+    obj.to_zarr(path, compute=True, encoding=encoding, mode="w")#compute=True doesnt do anything on non chunked arrays
     # print(f"duration={time.time()-start}s")
 
 checkpoint_xarray = mk_checkpoint(_save_xarray, _load_xarray)

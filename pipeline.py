@@ -147,7 +147,10 @@ async def process_rat_session(session_ds: xr.Dataset, session_index):
 
 def compute_neuron_type(meta, eeg, delta_t, duration, spike2_file):
     from pipeline_fct.rats import get_probe_data
+    import scipy.signal
     eeg_sig = get_probe_data(eeg, delta_t, duration, spike2_file).isel(channel=0).compute()
+    bp_params = scipy.signal.butter(4, [0.2, 2], btype="bandpass", output="sos", fs=eeg_sig["t"].attrs["fs"])
+    eeg_sig = xr.apply_ufunc(lambda s: scipy.signal.sosfiltfilt(bp_params, s), eeg_sig, input_core_dims=[["t"]], output_core_dims=[["t"]])
     neuron_types = []
     with sonfile(spike2_file) as rec:
         time_base = rec.GetTimeBase()
@@ -246,6 +249,9 @@ async def get_rats_combined_data(analysis_ds: xr.Dataset) -> Tuple[xr.DataArray,
             ar = ar.set_coords(ar.data_vars).assign_coords(session_index=k)
             all.append(ar)
         res = xr.concat(all, dim="index")
+        for v in res.coords:
+            if res[v].dtype==object:
+                res[v] = res[v].astype(str)
         return res
     
     def combine_neuron_types():
@@ -256,6 +262,10 @@ async def get_rats_combined_data(analysis_ds: xr.Dataset) -> Tuple[xr.DataArray,
             ar = ar.set_coords(ar.data_vars).assign_coords(subject=subject, session_grp=sgrp)
             all.append(ar)
         res = xr.concat(all, dim="index")
+        for v in res.coords:
+            if res[v].dtype==object:
+                res[v] = res[v].astype(str)
+        print(res)
         return res
 
     
@@ -269,13 +279,19 @@ async def get_rats_combined_data(analysis_ds: xr.Dataset) -> Tuple[xr.DataArray,
 
 async def process_rats_data(analysis_ds):
     all_welch, all_coh, all_meta, neuron_types = await get_rats_combined_data(analysis_ds)
-    neuron_types = neuron_types.assign_coords(neuron_type = xr.where(
-        neuron_types["proportion"] > 0.1, "Arky", xr.where(neuron_types["proportion"] < -0.1, "Proto", "")))
+    neuron_types["neuron_type"] = xr.where(neuron_types["proportion"] > 0.1, "Arky", xr.where(neuron_types["proportion"] < -0.1, "Proto", "")).astype(str)
+    neuron_types=neuron_types.set_coords("neuron_type")
+    print(neuron_types)
     channel_metadata = xr_merge(all_meta, analysis_ds.drop_dims(["signal_type", "structure"]), how="left", on=["session_index"])
     channel_metadata = xr_merge(channel_metadata, neuron_types, how="left", on=["session_grp", "subject", "chan_name_normalized"])
     channel_metadata["has_swa"] = channel_metadata["has_swa"].astype(bool)
-    channel_metadata.to_dataframe().reset_index(drop=True).to_excel(base_result_path/"rat_metadata.xlsx", index=False)
-    session_columns = ["subject", "session_index", "session", "condition", "has_swa", "is_APO"]
+    channel_metadata["neuron_type"] = channel_metadata["neuron_type"].fillna("").astype(str)
+    channel_df = channel_metadata.to_dataframe().reset_index(drop=True)
+    channel_df.astype({col: "int" for col in channel_df.select_dtypes("bool").columns}).to_excel(base_result_path/"rat_metadata.xlsx", index=False)
+    print(channel_df.columns)
+    print(channel_df[["is_APO", "has_swa"]])
+
+    session_columns = ["subject", "session_index", "session", "condition", "has_swa", "is_APO", "session_grp"]
     channel_columns = ["structure", "neuron_type", "chan_name", "chan_num"]
     channel_metadata = channel_metadata.reset_coords()
     all_welch = xr_merge(all_welch.to_dataset(name="pwelch").reset_coords(), channel_metadata[channel_columns + session_columns], 
@@ -286,14 +302,23 @@ async def process_rats_data(analysis_ds):
                            how="left", on=["session_index", "chan_num"+suffix])
     all_welch = all_welch.set_coords([c for c in all_welch.data_vars if not c=="pwelch"])["pwelch"]
     all_coh = all_coh.set_coords([c for c in all_coh.data_vars if not c=="coh"])["coh"]
+    for k in session_columns:
+        all_welch[k] = all_welch[k].broadcast_like(all_welch["channel"])
+        all_coh[k] = all_coh[k].broadcast_like(all_coh["channel_pair"])
     return all_welch, all_coh
 
 async def main():
     analysis_ds: xr.Dataset = (await checkpoint_xarray(get_session_info, "analysis_files.zarr",  "files", 0))()
     analysis_ds = analysis_ds.sortby("session").assign_coords(session_index=("session", np.arange(analysis_ds.sizes["session"]))).set_coords(analysis_ds.data_vars)
     logger.info("got analysis ds")
+    for v in analysis_ds.coords:
+        if analysis_ds[v].dtype==object:
+            analysis_ds[v] = analysis_ds[v].astype(str)
     print(analysis_ds)
     rat_welch, rat_coh = await process_rats_data(analysis_ds)
+    from pipeline_helper import _save_xarray
+    _save_xarray(rat_welch, base_result_path/"rat_welch.zarr")
+    _save_xarray(rat_coh, base_result_path/"rat_coh.zarr")
     print(rat_welch)
     print(rat_coh)
 

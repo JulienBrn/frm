@@ -16,10 +16,11 @@
     }
     ul {
       list-style: none;
-      padding: 0;
+      padding-left: 1em;
+      border-left: 2px solid #ddd;
     }
     li {
-      margin: 0.5em 0;
+      margin: 0.3em 0;
     }
     a {
       text-decoration: none;
@@ -29,31 +30,25 @@
     a:hover {
       text-decoration: underline;
     }
+    strong {
+      color: #444;
+    }
   </style>
 </head>
 <body>
-  <h1>Figures</h1>
-  <ul id="figures-list"></ul>
+  <h1>Figures Index</h1>
+  <ul>
+  <li><a href="./figures/index.html">index</a></li>
+  <li><strong>rats</strong>
+<ul>
+  <li><a href="./figures/rats/coh_phase_bua.html">coh_phase_bua</a></li>
+  <li><a href="./figures/rats/coh_phase_neuron.html">coh_phase_neuron</a></li>
+  <li><a href="./figures/rats/coh_power_bua.html">coh_power_bua</a></li>
+  <li><a href="./figures/rats/coh_power_neuron.html">coh_power_neuron</a></li>
+  <li><a href="./figures/rats/pwelch.html">pwelch</a></li>
+</ul>
+  </li>
+</ul>
 
-  <script>
-    // 👇 List your HTML figure files here
-    const figures = [
-      "pwelch_bua_rats.html",
-      "coh_power_bua_rats.html",
-      "coh_phase_bua_rats.html"
-    ];
-
-    const list = document.getElementById("figures-list");
-
-    // Dynamically create links
-    figures.forEach(file => {
-      const li = document.createElement("li");
-      const a = document.createElement("a");
-      a.href = `figures/${file}`;
-      a.textContent = file.replace(".html", ""); // show name without extension
-      li.appendChild(a);
-      list.appendChild(li);
-    });
-  </script>
 </body>
 </html>
