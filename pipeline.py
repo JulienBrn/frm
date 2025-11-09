@@ -287,15 +287,15 @@ async def process_rats_data():
     all_welch, all_coh, all_meta, neuron_types = await get_rats_combined_data(analysis_ds)
     neuron_types["neuron_type"] = xr.where(neuron_types["proportion"] > 0.1, "Arky", xr.where(neuron_types["proportion"] < -0.1, "Proto", "")).astype(str)
     neuron_types=neuron_types.set_coords("neuron_type")
-    print(neuron_types)
+    # print(neuron_types)
     channel_metadata = xr_merge(all_meta, analysis_ds.drop_dims(["signal_type", "structure"]), how="left", on=["session_index"])
     channel_metadata = xr_merge(channel_metadata, neuron_types, how="left", on=["session_grp", "subject", "chan_name_normalized"])
     channel_metadata["has_swa"] = channel_metadata["has_swa"].astype(bool)
     channel_metadata["neuron_type"] = channel_metadata["neuron_type"].fillna("").astype(str)
     channel_df = channel_metadata.to_dataframe().reset_index(drop=True)
     channel_df.astype({col: "int" for col in channel_df.select_dtypes("bool").columns}).to_excel(base_result_path/"rat_metadata.xlsx", index=False)
-    print(channel_df.columns)
-    print(channel_df[["is_APO", "has_swa"]])
+    # print(channel_df.columns)
+    # print(channel_df[["is_APO", "has_swa"]])
 
     session_columns = ["subject", "session_index", "session", "condition", "has_swa", "is_APO", "session_grp"]
     channel_columns = ["structure", "neuron_type", "chan_name", "chan_num"]
@@ -319,14 +319,33 @@ async def process_rats_data():
 
 def compute_monkey_raw_data(grp: pd.DataFrame, fs):
     from pipeline_fct.monkey import make_raw_chan
-    res = make_raw_chan(grp, monkey_basefolder, fs)
-    bua = compute_bua(res)
+    raw = make_raw_chan(grp, monkey_basefolder, fs)
+    bua = compute_bua(raw)
     ffts = compute_scaled_fft(bua)
     pwelch = (np.abs(ffts)**2).mean("t")
     return pwelch
 
+def compute_monkey_neuron_data(row: pd.Series, fs, neuron_fs=1000):
+    def get_continuous_data():
+        from scipy.io import loadmat
+        data: np.ndarray = loadmat(monkey_basefolder / row["file_path"], variable_names=["SUA"])["SUA"][0]/fs
+        n_values = int((row["end"] - row["start"]+2)*neuron_fs)
+        t = np.arange(n_values)/neuron_fs
+        indices = (data*neuron_fs).astype(int)
+        ar = np.zeros(t.size, dtype=float)
+        np.add.at(ar, indices, 1.0)
+        neuron_continuous = xr.DataArray(ar, dims="t")
+        neuron_continuous["t"] = row["start"]+t
+        neuron_continuous["t"].attrs["fs"] = neuron_fs
+        return neuron_continuous
+    raw = get_continuous_data()
+    ffts = compute_scaled_fft(raw)
+    pwelch = (np.abs(ffts)**2).mean("t")
+    return pwelch
+
+
+
 async def process_monkey_data():
-    fs =25000
     from pipeline_fct.monkey import get_electrode_groups
     from functools import partial
     analysis_df = pd.read_csv(monkey_basefolder/"BothMonkData_withTime.csv", header=1)
@@ -340,15 +359,28 @@ async def process_monkey_data():
         analysis_df["condition"] + "--" + analysis_df["monkey"] + "--" + analysis_df["structure"] + "--" 
         + analysis_df["session"].astype(str) + "--" + analysis_df["elec"].astype(str) + "--" + analysis_df["raw_chan"].astype(str)
     )
+    analysis_df["neuron_id"] = (
+        analysis_df["condition"] + "--" + analysis_df["monkey"] + "--" + analysis_df["structure"] + "--" 
+        + analysis_df["session"].astype(str) + "--" + analysis_df["elec"].astype(str) + "--" + analysis_df["unit"].astype(str)
+    )
 
     results = {}
+    results_neuron = {}
     async def process_raw_monkey(grp, id, priority):
-        res = await checkpoint_xarray(partial(compute_monkey_raw_data, grp, fs), f"monkey/welch/{id}.zarr", "monkey_welch", priority, "process")
+        res = await checkpoint_xarray(partial(compute_monkey_raw_data, grp, 25000), f"monkey/welch/{id}.zarr", "monkey_welch", priority, "process")
         results[id] = res
+
+    async def process_neuron_monkey(row, id, priority):
+        res = await checkpoint_xarray(partial(compute_monkey_neuron_data, row, 40000), f"monkey/neuron_welch/{id}.zarr", "monkey_neuron_welch", priority)
+        results_neuron[id] = res
 
     async with anyio.create_task_group() as tg:
         for ind, (id, grp) in enumerate(analysis_df.groupby("raw_id", group_keys=False)):
             tg.start_soon(process_raw_monkey, grp, id, ind)
+
+    async with anyio.create_task_group() as tg:
+        for ind, (_, row) in enumerate(analysis_df.iterrows()):
+            tg.start_soon(process_neuron_monkey, row, row["neuron_id"], ind)
 
     def combine_welch() -> xr.DataArray:
         all = []
@@ -358,10 +390,28 @@ async def process_monkey_data():
         res = xr.concat(all, dim="channel")
         return res
     
+    def combine_neuron_welch() -> xr.DataArray:
+        all = []
+        for k, a in results_neuron.items():
+            ar: xr.DataArray = a().compute().assign_coords(neuron_id=k, sig_type="neuron")
+            all.append(ar)
+        res = xr.concat(all, dim="channel")
+        return res
+    
     all_welch = (await checkpoint_xarray(combine_welch, f"monkey/combined_welch.zarr", f"monkey_combined_welch", 0))()
-    ds = analysis_df[["condition", "monkey", "session", "elec", "structure", "raw_id"]].drop_duplicates("raw_id").to_xarray().drop_vars("index").rename_dims(index="channel")
-    ds = xr_merge(all_welch.to_dataset(name="welch"), ds.set_coords(ds.data_vars), on="raw_id", how="left").sel(f=slice(None, 120))["welch"]
+    raw_ds = analysis_df[["condition", "monkey", "session", "elec", "structure", "raw_id"]].drop_duplicates("raw_id").to_xarray().drop_vars("index").rename_dims(index="channel")
+    raw_ds = xr_merge(all_welch.to_dataset(name="welch"), raw_ds.set_coords(raw_ds.data_vars), on="raw_id", how="left").sel(f=slice(None, 120))["welch"]
+
+
+    all_neuron_welch = (await checkpoint_xarray(combine_neuron_welch, f"monkey/combined_neuron_welch.zarr", f"monkey_combined_neuron_welch", 0))()
+    neuron_ds = analysis_df[["condition", "monkey", "session", "elec", "structure", "neuron_id"]].to_xarray().drop_vars("index").rename_dims(index="channel")
+    neuron_ds["neuron_id"] = neuron_ds["neuron_id"].astype(str)
+    neuron_ds = xr_merge(all_neuron_welch.to_dataset(name="welch"), neuron_ds.set_coords(neuron_ds.data_vars), on="neuron_id", how="left").sel(f=slice(None, 120))["welch"]
+    print(neuron_ds)
+    ds = xr.concat([raw_ds.rename(raw_id="id"), neuron_ds.rename(neuron_id="id")], dim="channel")
+
     ds = ds.rename(monkey="subject")
+    # print(ds)
     return ds
     
 async def main():
@@ -372,7 +422,7 @@ async def main():
     monkey_welch = await process_monkey_data()
 
     #Probably some saving here too
-    common_coords = ["f", "sig_type", "condition", "structure", "species", "neuron_type"]
+    common_coords = ["f", "sig_type", "condition", "structure", "species", "neuron_type", "subject"]
     common_rat_welch = (
         rat_welch.assign_coords(species="Rat").where(~(rat_welch["has_swa"] | rat_welch["is_APO"]), drop=True)
         .drop_vars(k for k in rat_welch.coords if not k in common_coords)
@@ -380,11 +430,12 @@ async def main():
     )
     common_monkey_welch = monkey_welch.assign_coords(species="Monkey", neuron_type="").drop_vars(k for k in monkey_welch.coords if not k in common_coords)
     common_monkey_welch["condition"] = xr.where(common_monkey_welch["condition"]=="healthy", "CTL", "Park")
+    common_monkey_welch["structure"] = xr.where(common_monkey_welch["structure"]=="MSN", "STR", common_monkey_welch["structure"])
     all_species_welch = xr.concat([common_monkey_welch, common_rat_welch], dim="channel")
     for c in all_species_welch.coords:
         if all_species_welch[c].dtype==object:
             all_species_welch[c] = all_species_welch[c].astype(str)
-    print(all_species_welch)
+    # print(all_species_welch)
     _save_xarray(all_species_welch, base_result_path/"all_species_welch.zarr")
     # print(all_species_welch.to_dataset(name="welch").groupby(common_coords[1:]).apply(lambda d: xr.DataArray(d.sizes["channel"])))
 if __name__ == "__main__":
