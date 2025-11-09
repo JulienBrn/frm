@@ -21,6 +21,7 @@ import logging
 import h5py
 import beautifullogger
 from typing import Tuple
+from unionfind import unionfind
 
 print = lambda a: tqdm.tqdm.write(str(a))
 xr.set_options(display_max_rows=100)
@@ -39,6 +40,7 @@ client= None
 
 spike2files_basefolder = Path("/media/julienb/T7 Shield/Revue-FRM/RawData/Rats/Version-RAW-2-Nico/")
 mat_basefolder = Path("/media/julienb/T7 Shield/Revue-FRM/RawData/Rats/Version-Matlab-Nico/")
+monkey_basefolder = Path("/media/julienb/T7 Shield/Revue-FRM/RawData/Monkeys/")
 base_result_path = Path("/media/julienb/T7 Shield/Revue-FRM/AnalysisData3/")
 
 set_base_result_path(base_result_path)
@@ -102,8 +104,6 @@ async def process_rat_session(session_ds: xr.Dataset, session_index):
             session_str = session_ds["session"].item()
             spike2_file = session_ds["spike2_file"].item()
             mat_file = session_ds["mat_file"]
-
-            
 
             def compute_ffts(initial_sigs):
                 fft = compute_scaled_fft(initial_sigs).sel(f=slice(None, 120))
@@ -214,14 +214,14 @@ async def get_rats_combined_data(analysis_ds: xr.Dataset) -> Tuple[xr.DataArray,
     async with anyio.create_task_group() as tg:
         for s in range(analysis_ds.sizes["session"]):
             ds = analysis_ds.isel(session=s)
-            tg.start_soon(add_session_result, ds, s)
+            tg.start_soon(add_session_result, ds, ds["session_index"].item())
             await anyio.sleep(0)
 
     async with anyio.create_task_group() as tg:
         for k, (_, _, meta) in results.items():
             session_ds = analysis_ds.isel(session=k)
             if session_ds["has_swa"] == 1:
-                tg.start_soon(add_neuron_types, session_ds, meta, k)
+                tg.start_soon(add_neuron_types, session_ds, meta, session_ds["session_index"].item())
                 await anyio.sleep(0)
 
 
@@ -277,7 +277,13 @@ async def get_rats_combined_data(analysis_ds: xr.Dataset) -> Tuple[xr.DataArray,
     return all_welch, all_coh, all_meta, all_nt
 
 
-async def process_rats_data(analysis_ds):
+async def process_rats_data():
+    analysis_ds: xr.Dataset = (await checkpoint_xarray(get_session_info, "analysis_files.zarr",  "files", 0))()
+    analysis_ds = analysis_ds.sortby("session").assign_coords(session_index=("session", np.arange(analysis_ds.sizes["session"]))).set_coords(analysis_ds.data_vars)
+    logger.info("got analysis ds")
+    for v in analysis_ds.coords:
+        if analysis_ds[v].dtype==object:
+            analysis_ds[v] = analysis_ds[v].astype(str)
     all_welch, all_coh, all_meta, neuron_types = await get_rats_combined_data(analysis_ds)
     neuron_types["neuron_type"] = xr.where(neuron_types["proportion"] > 0.1, "Arky", xr.where(neuron_types["proportion"] < -0.1, "Proto", "")).astype(str)
     neuron_types=neuron_types.set_coords("neuron_type")
@@ -307,20 +313,79 @@ async def process_rats_data(analysis_ds):
         all_coh[k] = all_coh[k].broadcast_like(all_coh["channel_pair"])
     return all_welch, all_coh
 
-async def main():
-    analysis_ds: xr.Dataset = (await checkpoint_xarray(get_session_info, "analysis_files.zarr",  "files", 0))()
-    analysis_ds = analysis_ds.sortby("session").assign_coords(session_index=("session", np.arange(analysis_ds.sizes["session"]))).set_coords(analysis_ds.data_vars)
-    logger.info("got analysis ds")
-    for v in analysis_ds.coords:
-        if analysis_ds[v].dtype==object:
-            analysis_ds[v] = analysis_ds[v].astype(str)
-    print(analysis_ds)
-    rat_welch, rat_coh = await process_rats_data(analysis_ds)
-    from pipeline_helper import _save_xarray
-    _save_xarray(rat_welch, base_result_path/"rat_welch.zarr")
-    _save_xarray(rat_coh, base_result_path/"rat_coh.zarr")
-    print(rat_welch)
-    print(rat_coh)
 
+
+
+
+def compute_monkey_raw_data(grp: pd.DataFrame, fs):
+    from pipeline_fct.monkey import make_raw_chan
+    res = make_raw_chan(grp, monkey_basefolder, fs)
+    bua = compute_bua(res)
+    ffts = compute_scaled_fft(bua)
+    pwelch = (np.abs(ffts)**2).mean("t")
+    return pwelch
+
+async def process_monkey_data():
+    fs =25000
+    from pipeline_fct.monkey import get_electrode_groups
+    from functools import partial
+    analysis_df = pd.read_csv(monkey_basefolder/"BothMonkData_withTime.csv", header=1)
+    analysis_df["structure"] = analysis_df.pop("struct").str.slice(0, 3)
+    analysis_df["file_path"] = (
+        analysis_df["condition"] + "/" + analysis_df["monkey"] + "/" + analysis_df["structure"] + "/" + analysis_df["session"].astype(str) + "/" 
+        + "unit"+analysis_df["unit"].astype(str) + ".mat"
+    ) 
+    analysis_df["raw_chan"] = analysis_df.groupby(["condition", "monkey","structure", "elec", "session"], group_keys=False).apply(get_electrode_groups, include_groups=False)
+    analysis_df["raw_id"] = (
+        analysis_df["condition"] + "--" + analysis_df["monkey"] + "--" + analysis_df["structure"] + "--" 
+        + analysis_df["session"].astype(str) + "--" + analysis_df["elec"].astype(str) + "--" + analysis_df["raw_chan"].astype(str)
+    )
+
+    results = {}
+    async def process_raw_monkey(grp, id, priority):
+        res = await checkpoint_xarray(partial(compute_monkey_raw_data, grp, fs), f"monkey/welch/{id}.zarr", "monkey_welch", priority, "process")
+        results[id] = res
+
+    async with anyio.create_task_group() as tg:
+        for ind, (id, grp) in enumerate(analysis_df.groupby("raw_id", group_keys=False)):
+            tg.start_soon(process_raw_monkey, grp, id, ind)
+
+    def combine_welch() -> xr.DataArray:
+        all = []
+        for k, a in results.items():
+            ar: xr.DataArray = a().compute().assign_coords(raw_id=k, sig_type="bua")
+            all.append(ar)
+        res = xr.concat(all, dim="channel")
+        return res
+    
+    all_welch = (await checkpoint_xarray(combine_welch, f"monkey/combined_welch.zarr", f"monkey_combined_welch", 0))()
+    ds = analysis_df[["condition", "monkey", "session", "elec", "structure", "raw_id"]].drop_duplicates("raw_id").to_xarray().drop_vars("index").rename_dims(index="channel")
+    ds = xr_merge(all_welch.to_dataset(name="welch"), ds.set_coords(ds.data_vars), on="raw_id", how="left").sel(f=slice(None, 120))["welch"]
+    ds = ds.rename(monkey="subject")
+    return ds
+    
+async def main():
+    from pipeline_helper import _save_xarray
+    rat_welch, rat_coh = await process_rats_data()
+    # _save_xarray(rat_welch, base_result_path/"rat_welch.zarr")
+    # _save_xarray(rat_coh, base_result_path/"rat_coh.zarr")
+    monkey_welch = await process_monkey_data()
+
+    #Probably some saving here too
+    common_coords = ["f", "sig_type", "condition", "structure", "species", "neuron_type"]
+    common_rat_welch = (
+        rat_welch.assign_coords(species="Rat").where(~(rat_welch["has_swa"] | rat_welch["is_APO"]), drop=True)
+        .drop_vars(k for k in rat_welch.coords if not k in common_coords)
+        
+    )
+    common_monkey_welch = monkey_welch.assign_coords(species="Monkey", neuron_type="").drop_vars(k for k in monkey_welch.coords if not k in common_coords)
+    common_monkey_welch["condition"] = xr.where(common_monkey_welch["condition"]=="healthy", "CTL", "Park")
+    all_species_welch = xr.concat([common_monkey_welch, common_rat_welch], dim="channel")
+    for c in all_species_welch.coords:
+        if all_species_welch[c].dtype==object:
+            all_species_welch[c] = all_species_welch[c].astype(str)
+    print(all_species_welch)
+    _save_xarray(all_species_welch, base_result_path/"all_species_welch.zarr")
+    # print(all_species_welch.to_dataset(name="welch").groupby(common_coords[1:]).apply(lambda d: xr.DataArray(d.sizes["channel"])))
 if __name__ == "__main__":
     anyio.run(main, backend="trio")

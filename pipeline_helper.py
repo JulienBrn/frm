@@ -124,7 +124,7 @@ def mk_checkpoint(
     save_fn: Callable[[T, Path], None],
     load_fn: Callable[[Path], T]
 ) -> Callable[
-    [Callable[[], T], Path, str, float],
+    [Callable[[], T], Path, str, float,  Literal["thread", "process"]],
     Awaitable[Callable[[], T]]
 ]:
     async def checkpoint(func, path: Path, group: str, priority: float, mode: Literal["thread", "process"] = "thread"):
