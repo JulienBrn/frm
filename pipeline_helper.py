@@ -84,6 +84,9 @@ def add_note_to_exception(exc, note):
     new_exc.__context__ = exc.__context__
     return new_exc
 
+def close():
+    for bar in groups.values():
+        bar[0].close()
 
 def in_runner_func(func, tmp_path, save_fn):
     res = func()
@@ -132,7 +135,7 @@ def mk_checkpoint(
         path = base_result_path/path
         #No need for thread safety, this should always be called from the main thread
         if not group in groups:
-            groups[group] = [tqdm.tqdm(desc=group, total=0), 0, 0]
+            groups[group] = [tqdm.tqdm(desc=group, total=0, leave=True), 0, 0]
         bar = groups[group][0]
         if not path.exists():
             bar.total+=1

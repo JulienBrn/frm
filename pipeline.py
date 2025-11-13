@@ -23,6 +23,8 @@ import beautifullogger
 from typing import Tuple
 from unionfind import unionfind
 
+import pipeline_helper
+old_print = print
 print = lambda a: tqdm.tqdm.write(str(a))
 xr.set_options(display_max_rows=100)
 
@@ -41,7 +43,7 @@ client= None
 spike2files_basefolder = Path("/media/julienb/T7 Shield/Revue-FRM/RawData/Rats/Version-RAW-2-Nico/")
 mat_basefolder = Path("/media/julienb/T7 Shield/Revue-FRM/RawData/Rats/Version-Matlab-Nico/")
 monkey_basefolder = Path("/media/julienb/T7 Shield/Revue-FRM/RawData/Monkeys/")
-base_result_path = Path("/media/julienb/T7 Shield/Revue-FRM/AnalysisData5/")
+base_result_path = Path("/media/julienb/T7 Shield/Revue-FRM/AnalysisData6/")
 
 set_base_result_path(base_result_path)
 set_limiter(5)
@@ -54,7 +56,7 @@ class AccepTableError(Exception):
     def __init__(self, group, info):
         super().__init__(group)
         if not group in error_groups:
-            error_groups[group] = tqdm.tqdm(desc=f"{RED}Error {group}{RESET}", leave=False)
+            error_groups[group] = tqdm.tqdm(desc=f"{RED}Error {group}{RESET}", leave=True)
         acceptable_errors.append(dict(group=group, info=info))
         error_groups[group].update(1)
         error_groups[group].refresh()
@@ -62,7 +64,7 @@ class AccepTableError(Exception):
 
 
 def get_session_info():
-    spike2files = [p for p in spike2files_basefolder.glob("**/*.smr") if not "events" in str(p).lower()]
+    spike2files = [p for p in spike2files_basefolder.glob("**/*.smr") if not "event" in str(p).lower()]
     spike2df = get_smrx_metadata([p.relative_to(spike2files_basefolder) for p in spike2files])
     mat_files = list(mat_basefolder.glob("**/*.mat"))
     mat_df = get_matfile_metadata([p.relative_to(mat_basefolder) for p in mat_files])
@@ -311,6 +313,9 @@ async def get_rats_combined_data(analysis_ds: xr.Dataset) -> Tuple[xr.DataArray,
 
 async def process_rats_data():
     analysis_ds: xr.Dataset = (await checkpoint_xarray(get_session_info, "analysis_files.zarr",  "files", 0))()
+    analysis_ds = analysis_ds.sel(session=(analysis_ds["mat_file"]!="").any(["signal_type", "structure"]))
+    # print(analysis_ds)
+    # raise Exception("Stop")
     analysis_ds = analysis_ds.sortby("session").assign_coords(session_index=("session", np.arange(analysis_ds.sizes["session"]))).set_coords(analysis_ds.data_vars)
     logger.info("got analysis ds")
     for v in analysis_ds.coords:
@@ -322,7 +327,7 @@ async def process_rats_data():
     # print(neuron_types)
     # print(all_meta.to_dataframe().reset_index()["condition"].unique())
     # print(analysis_ds.drop_dims(["signal_type", "structure"]))
-    channel_metadata = xr_merge(all_meta.drop_vars(["condition", "is_APO","has_swa", "session", "session_grp", "spike2_file", "subject"]), analysis_ds.drop_dims(["signal_type", "structure"]), how="left", on=["session_index"])
+    channel_metadata = xr_merge(all_meta.drop_vars(["condition", "is_APO","has_swa", "session", "session_grp", "spike2_file", "subject", "mat_date", "segment_index"]), analysis_ds.drop_dims(["signal_type", "structure"]), how="left", on=["session_index"])
     channel_metadata = xr_merge(channel_metadata, neuron_types, how="left", on=["session_grp", "subject", "chan_name_normalized"])
     channel_metadata["has_swa"] = channel_metadata["has_swa"].astype(bool)
     channel_metadata["neuron_type"] = channel_metadata["neuron_type"].fillna("").astype(str)
@@ -441,7 +446,7 @@ async def process_monkey_data():
     neuron_ds = analysis_df[["condition", "monkey", "session", "elec", "structure", "neuron_id"]].to_xarray().drop_vars("index").rename_dims(index="channel")
     neuron_ds["neuron_id"] = neuron_ds["neuron_id"].astype(str)
     neuron_ds = xr_merge(all_neuron_welch.to_dataset(name="welch"), neuron_ds.set_coords(neuron_ds.data_vars), on="neuron_id", how="left").sel(f=slice(None, 120))["welch"]
-    print(neuron_ds)
+    # print(neuron_ds)
     ds = xr.concat([raw_ds.rename(raw_id="id"), neuron_ds.rename(neuron_id="id")], dim="channel")
 
     ds = ds.rename(monkey="subject")
@@ -475,7 +480,9 @@ async def main():
     # print(all_species_welch.to_dataset(name="welch").groupby(common_coords[1:]).apply(lambda d: xr.DataArray(d.sizes["channel"])))
     pd.DataFrame(acceptable_errors).to_excel(base_result_path/"all_known_errors.xlsx", index=False)
 if __name__ == "__main__":
-    anyio.run(main, backend="trio")
-    print("Done")
-    input()
-    
+    try:
+        anyio.run(main, backend="trio")
+    finally:
+        for bar in error_groups.values():
+            bar.close()
+        pipeline_helper.close()
