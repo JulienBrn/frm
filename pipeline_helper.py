@@ -258,6 +258,37 @@ def single(yes: bool = True):
         return _Single(_lock, _event_lock)
     else:
         return _noop_async_cm()
+    
+RED = "\033[91m"
+RESET = "\033[0m"
+import weakref
+import csv, os
+
+class ErrorReport:
+    class ReportedError(Exception): pass
+    def __init__(self, file: Path):
+        self.file = Path(file)
+        self.file.parent.mkdir(exist_ok=True, parents=True)
+        self.file.unlink(missing_ok=True)
+        self.error_counters = {}
+
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+    def report_error(self, group: str, extra_info: str = "", raise_excpt: bool = True):
+        with self.file.open("a", newline='', encoding='utf-8') as f:
+            writer = csv.writer(f, quoting=csv.QUOTE_ALL, delimiter="\t")
+            writer.writerow([group, extra_info])
+        if group not in self.error_counters:
+            self.error_counters[group] = tqdm.tqdm(desc=f"{RED}Error {group}{RESET}", leave=True)
+        self.error_counters[group].update(1)
+        self.error_counters[group].refresh()
+        if raise_excpt:
+            raise ErrorReport.ReportedError(f"{group} {extra_info}")
 
 # async def checkpoint_xarray(func, path: Path, group: str, priority: float):
 #     id = str(path)

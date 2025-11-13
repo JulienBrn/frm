@@ -5,11 +5,11 @@ from requests import session
 # from dafn.dask_helper import checkpoint_xra_zarr, checkpoint_xrds_zarr, checkpoint_delayed
 from dafn.xarray_utilities import xr_merge, chunk, replicate_dim
 from pipeline_fct.rats import get_matfile_metadata, get_smrx_metadata, rat_raw_chan_classification, get_mat_df, get_initial_sigs, may_match
-from dafn.signal_processing import compute_bua, compute_lfp, compute_scaled_fft
+from dafn.signal_processing import compute_bua, compute_lfp, compute_scaled_fft, compute_coherence
 from dafn.spike2 import smrxadc2electrophy, smrxchanneldata, sonfile
 from dafn.signal_processing import compute_lfp, compute_bua
 from dafn.utilities import flexible_merge, ValidationError
-from pipeline_helper import checkpoint_xarray, checkpoint_json, checkpoint_excel, single, add_note_to_exception, set_limiter, set_base_result_path
+from pipeline_helper import checkpoint_xarray, checkpoint_json, checkpoint_excel, single, add_note_to_exception, set_limiter, set_base_result_path, ErrorReport
 
 from pathlib import Path
 import pandas as pd, numpy as np, xarray as xr
@@ -43,23 +43,31 @@ client= None
 spike2files_basefolder = Path("/media/julienb/T7 Shield/Revue-FRM/RawData/Rats/Version-RAW-2-Nico/")
 mat_basefolder = Path("/media/julienb/T7 Shield/Revue-FRM/RawData/Rats/Version-Matlab-Nico/")
 monkey_basefolder = Path("/media/julienb/T7 Shield/Revue-FRM/RawData/Monkeys/")
-base_result_path = Path("/media/julienb/T7 Shield/Revue-FRM/AnalysisData6/")
+base_result_path = Path("/media/julienb/T7 Shield/Revue-FRM/AnalysisData7/")
 
 set_base_result_path(base_result_path)
 set_limiter(5)
-error_groups = {}
-acceptable_errors = []
+# error_groups = {}
+# acceptable_errors = []
 
-RED = "\033[91m"
-RESET = "\033[0m"
-class AccepTableError(Exception): 
-    def __init__(self, group, info):
-        super().__init__(group)
-        if not group in error_groups:
-            error_groups[group] = tqdm.tqdm(desc=f"{RED}Error {group}{RESET}", leave=True)
-        acceptable_errors.append(dict(group=group, info=info))
-        error_groups[group].update(1)
-        error_groups[group].refresh()
+if __name__ == "__main__":
+    error_report = ErrorReport(base_result_path/"reported_errors.tsv")
+# class AccepTableError(Exception): 
+#     def __init__(self, group, info):
+#         super().__init__(group)
+#         if not group in error_groups:
+#             error_groups[group] = tqdm.tqdm(desc=f"{RED}Error {group}{RESET}", leave=True)
+#         acceptable_errors.append(dict(group=group, info=info))
+#         error_groups[group].update(1)
+#         error_groups[group].refresh()
+
+
+
+
+
+# class ErrorReport:
+#     def __init__(self, file_obj):
+#         self.file_obj = file_obj
 
 
 
@@ -113,30 +121,30 @@ async def process_rat_session(session_ds: xr.Dataset, session_index):
                 def select(a1, a2):
                     return ((a1["sig_type"] == "eeg") | (a2["sig_type"] == "eeg")) | ((a1["sig_type"] == a2["sig_type"]))
                 a1, a2 = replicate_dim(fft_merged, "channel", 2, select, "stacked", stacked_dim="channel_pair")
-                coh =chunk((a1*np.conj(a2)).mean("t"), channel_pair=1).reset_coords(["structure_1", "structure_2"], drop=True)
+                coh =chunk(compute_coherence(a1, a2), channel_pair=1).reset_coords(["structure_1", "structure_2"], drop=True)
                 return coh
 
             all_chans: pd.DataFrame = (await checkpoint_excel(partial(get_channel_metadata, spike2_file, mat_file, mat_basefolder), 
                                 f"chan_metadata/{session_str}.xlsx", "chan_metadata", session_index, mode="process"))()
             if all_chans.empty:
-                raise AccepTableError("No Data", spike2_file)
+                error_report.report_error("No Data", spike2_file)
             if all_chans.loc[all_chans["chan_group"] == "EEGIpsi"].empty:
-                AccepTableError("No EEG for session", spike2_file)
+                error_report.report_error("No EEG for session", spike2_file, False)
             if not "mat_key" in all_chans:
-                raise AccepTableError("No matched mat channel", spike2_file)
+                error_report.report_error("No matched mat channel", spike2_file)
             all_chans = all_chans.loc[~all_chans["mat_key"].isna() | (all_chans["chan_group"]=="EEGIpsi")]
             if all_chans["chan_num"].isna().any():
                 # print(all_chans)
-                AccepTableError("Mat chan not found in spike2", spike2_file)
+                error_report.report_error("Mat chan not found in spike2", spike2_file, False)
             all_chans = all_chans.loc[~all_chans["chan_num"].isna()]
                 # print(all_chans)
                 # raise Exception("Stop")
             if all_chans.empty:
-                raise AccepTableError("Empty channels after merge", spike2_file)
+                error_report.report_error("Empty channels after merge", spike2_file)
             if all_chans.duplicated("chan_num").any():
-                AccepTableError("Duplicated spike2 channels", spike2_file)
+                error_report.report_error("Duplicated spike2 channels", spike2_file, False)
             if all_chans.duplicated("mat_key").any():
-                AccepTableError("Duplicated spike2 channels", spike2_file)
+                error_report.report_error("Duplicated spike2 channels", spike2_file, False)
             all_chans=all_chans.loc[~(all_chans.duplicated("chan_num", keep=False) | all_chans.duplicated("mat_key", keep=False))]
             all_chans["chan_num"] = all_chans["chan_num"].astype(int)
             all_chans["is_APO"] = all_chans["is_APO"].astype(bool)
@@ -144,11 +152,11 @@ async def process_rat_session(session_ds: xr.Dataset, session_index):
             
 
             if all_chans.loc[all_chans["chan_group"] == "EEGIpsi"].empty:
-                AccepTableError("No EEG for session after merge", spike2_file)
+                error_report.report_error("No EEG for session after merge", spike2_file, False)
             if all_chans.loc[all_chans["physical_channel"] >= 0].empty:
-                raise AccepTableError("No raw data for session after merge", spike2_file)
+                error_report.report_error("No raw data for session after merge", spike2_file)
             if all_chans.loc[all_chans["chan_group"] != "EEGIpsi"].empty:
-                raise AccepTableError("Only eeg data after merge", spike2_file)
+                error_report.report_error("Only eeg data after merge", spike2_file)
             
             all_chans["delta_t"] =  all_chans["delta_t"].ffill().bfill()
             all_chans["common_duration"] =  all_chans["common_duration"].ffill().bfill()
@@ -163,14 +171,14 @@ async def process_rat_session(session_ds: xr.Dataset, session_index):
             
             all_chans["chan_name_normalized"] = all_chans["chan_name"].str.translate(str.maketrans('', '', "_-/ "))
             if all_chans["chan_name_normalized"].duplicated().any():
-                raise AccepTableError("Not unique normalized names...", spike2_file)
+                error_report.report_error("Not unique normalized names...", spike2_file)
             initial_sigs = (await checkpoint_xarray(partial(get_initial_sigs, all_chans, spike2_file), 
                             f"init_sig/{session_str}.zarr", "init_sig", session_index, mode="process"))
             ffts =  (await checkpoint_xarray(lambda: compute_ffts(initial_sigs()), f"fft/{session_str}.zarr", "fft", session_index))
             pwelch = (await checkpoint_xarray(lambda: compute_pwelch(ffts()), f"pwelch/{session_str}.zarr", "pwelch", session_index))
             coh = (await checkpoint_xarray(lambda: compute_coh(ffts(), all_chans), f"coh/{session_str}.zarr", "coh", session_index))
             return pwelch, coh, all_chans
-        except AccepTableError as e:
+        except ErrorReport.ReportedError as e:
             return None
         except Exception as e:
             add_note_to_exception(e, f"While processing session with index {session_index}")
@@ -205,17 +213,17 @@ async def process_neuron_types(session_ds, meta: pd.DataFrame, session_index):
         duration = meta["common_duration"].min()
         eeg = meta.loc[meta["chan_group"]=="EEGIpsi"]
         if eeg.empty:
-            raise AccepTableError("No eeg data in swa session", spike2_file)
+            error_report.report_error("No eeg data in swa session", spike2_file)
         elif len(eeg.index) > 1:
             raise Exception("More than one eeg signal...")
         
         res =  (await checkpoint_excel(partial(compute_neuron_type, meta, eeg, delta_t, duration, spike2_file), 
                                 f"neuron_type/{session_str}.xlsx", "neuron_type", session_index, mode="process"))()
         if res.empty:
-            raise AccepTableError("No GPe neurons in swa session", spike2_file)
+            error_report.report_error("No GPe neurons in swa session", spike2_file)
         res = pd.merge(res, meta[["chan_num", "chan_name_normalized", "mat_key"]], how="left", on="chan_num")
         return res[["proportion", "chan_name_normalized"]]
-    except AccepTableError as e:
+    except ErrorReport.ReportedError as e:
         return None
     except Exception as e:
         add_note_to_exception(e, f"While processing neuron types on session with index {session_index}")
@@ -307,7 +315,7 @@ async def get_rats_combined_data(analysis_ds: xr.Dataset) -> Tuple[xr.DataArray,
     n_per_grp = all_meta.to_dataframe().reset_index().groupby(["is_APO", "subject", "session_grp"])["has_swa"].nunique()
     for _, row in n_per_grp.loc[n_per_grp!=2].reset_index().iterrows():
         if not row["is_APO"]:
-            AccepTableError("No swa session", row["subject"]+"--"+row["session_grp"])
+            error_report.report_error("No swa session", row["subject"]+"--"+row["session_grp"], False)
     return all_welch, all_coh, all_meta, all_nt
 
 
