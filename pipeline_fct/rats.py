@@ -200,6 +200,9 @@ def get_initial_sigs(all_chans, spike2_file):
     raise Exception("start_t problem")
   delta_t = all_chans["delta_t"].max()
   if (np.abs(all_chans["delta_t"] - delta_t) > 10**-3).any():
+      print("\n\n\n\n\n\n\n\n\nHERE\n\n\n\n\n\n\n\n\n\n\n")
+      print(all_chans)
+      all_chans.to_excel("test.xlsx")
       raise Exception("delta_t problem")
   duration = all_chans["common_duration"].min()
   probe_data = get_probe_data(all_chans.loc[all_chans["chan_group"] == "Probe"], delta_t, duration, spike2_file)
