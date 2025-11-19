@@ -89,14 +89,19 @@ def close():
         bar[0].close()
 
 def in_runner_func(func, tmp_path, save_fn):
-    res = func()
-    tmp_path.parent.mkdir(exist_ok=True, parents=True)
-    if tmp_path.exists():
-        if tmp_path.is_dir():
-            shutil.rmtree(tmp_path)
-        else:
-            tmp_path.unlink()
-    save_fn(res, tmp_path)
+    try:
+        res = func()
+        tmp_path.parent.mkdir(exist_ok=True, parents=True)
+        if tmp_path.exists():
+            if tmp_path.is_dir():
+                shutil.rmtree(tmp_path)
+            else:
+                tmp_path.unlink()
+        save_fn(res, tmp_path)
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        raise Exception(tb)
 
 from multiprocessing.reduction import ForkingPickler
 import io
@@ -217,7 +222,7 @@ def _load_json(path: Path):
 checkpoint_json =  mk_checkpoint(_save_json, _load_json)
 
 def _save_excel(obj: pd.DataFrame, path: Path):
-    obj.to_excel(path)
+    obj.to_excel(path, index=False)
 
 def _load_excel(path: Path) -> pd.DataFrame:
     return pd.read_excel(path)
@@ -261,8 +266,7 @@ def single(yes: bool = True):
     
 RED = "\033[91m"
 RESET = "\033[0m"
-import weakref
-import csv, os
+import csv
 
 class ErrorReport:
     class ReportedError(Exception): pass
@@ -279,16 +283,16 @@ class ErrorReport:
     def __exit__(self, exc_type, exc_val, exc_tb):
         pass
 
-    def report_error(self, group: str, extra_info: str = "", raise_excpt: bool = True):
+    def report_error(self, group: str, *args, raise_excpt: bool = True):
         with self.file.open("a", newline='', encoding='utf-8') as f:
             writer = csv.writer(f, quoting=csv.QUOTE_ALL, delimiter="\t")
-            writer.writerow([group, extra_info])
+            writer.writerow([group]+list(args))
         if group not in self.error_counters:
             self.error_counters[group] = tqdm.tqdm(desc=f"{RED}Error {group}{RESET}", leave=True)
         self.error_counters[group].update(1)
         self.error_counters[group].refresh()
         if raise_excpt:
-            raise ErrorReport.ReportedError(f"{group} {extra_info}")
+            raise ErrorReport.ReportedError(f"{group} {args}")
 
 # async def checkpoint_xarray(func, path: Path, group: str, priority: float):
 #     id = str(path)

@@ -5,7 +5,7 @@ from requests import session
 # from dafn.dask_helper import checkpoint_xra_zarr, checkpoint_xrds_zarr, checkpoint_delayed
 from dafn.xarray_utilities import xr_merge, chunk, replicate_dim
 from pipeline_fct.rats import get_matfile_metadata, get_smrx_metadata, rat_raw_chan_classification, get_mat_df, get_initial_sigs, may_match
-from dafn.signal_processing import compute_bua, compute_lfp, compute_scaled_fft, compute_coherence
+from dafn.signal_processing import compute_bua, compute_lfp, compute_scaled_fft, compute_coherence, spiketimes_to_continuous
 from dafn.spike2 import smrxadc2electrophy, smrxchanneldata, sonfile
 from dafn.signal_processing import compute_lfp, compute_bua
 from dafn.utilities import flexible_merge, ValidationError
@@ -43,14 +43,15 @@ client= None
 spike2files_basefolder = Path("/media/julienb/T7 Shield/Revue-FRM/RawData/Rats/Version-RAW-2-Nico/")
 mat_basefolder = Path("/media/julienb/T7 Shield/Revue-FRM/RawData/Rats/Version-Matlab-Nico/")
 monkey_basefolder = Path("/media/julienb/T7 Shield/Revue-FRM/RawData/Monkeys/")
-base_result_path = Path("/media/julienb/T7 Shield/Revue-FRM/AnalysisData7/")
+human_basefolder = Path("/media/julienb/T7 Shield/Revue-FRM/RawData/Humans/")
+base_result_path = Path("/media/julienb/T7 Shield/Revue-FRM/AnalysisData8/")
 
 set_base_result_path(base_result_path)
 set_limiter(5)
 # error_groups = {}
 # acceptable_errors = []
 
-if __name__ == "__main__":
+if __name__ == "__main__": #To protect against multiprocessing
     error_report = ErrorReport(base_result_path/"reported_errors.tsv")
 # class AccepTableError(Exception): 
 #     def __init__(self, group, info):
@@ -91,7 +92,7 @@ def get_session_info():
 def get_channel_metadata(spike2_file, mat_file, mat_basefolder):
     spike2_chans = smrxchanneldata(spike2_file)
     mat_chans = get_mat_df(mat_file, mat_basefolder)
-    spike2_chans = spike2_chans.loc[spike2_chans["chan_type"].isin(["Adc", "EventRise"])]
+    
     spike2_chans["chan_group"] = spike2_chans["chan_name"].str.lower().apply(rat_raw_chan_classification)
     spike2_chans["chan_group"] = np.where(spike2_chans["physical_channel"]<0, "neuron", spike2_chans["chan_group"])
     all_chans = flexible_merge(spike2_chans, mat_chans, "callable", lambda l, r: may_match(l, r, mat_basefolder, spike2_file), how="outer", suffixes=("", "_mat"))
@@ -128,27 +129,30 @@ async def process_rat_session(session_ds: xr.Dataset, session_index):
                                 f"chan_metadata/{session_str}.xlsx", "chan_metadata", session_index, mode="process"))()
             if all_chans.empty:
                 error_report.report_error("No Data", spike2_file)
+            all_chans = all_chans.loc[all_chans["chan_type"].isin(["Adc", "EventRise"])]
+            if all_chans.empty:
+                error_report.report_error("No Data after chantype filtering", spike2_file)
             if all_chans.loc[all_chans["chan_group"] == "EEGIpsi"].empty:
-                error_report.report_error("No EEG for session", spike2_file, False)
+                error_report.report_error("No EEG for session", spike2_file, f"chan_metadata/{session_str}.xlsx", raise_excpt=False)
             if not "mat_key" in all_chans:
                 error_report.report_error("No matched mat channel", spike2_file)
             all_chans = all_chans.loc[~all_chans["mat_key"].isna() | (all_chans["chan_group"]=="EEGIpsi")]
             if all_chans["chan_num"].isna().any():
                 # print(all_chans)
-                error_report.report_error("Mat chan not found in spike2", spike2_file, False)
+                error_report.report_error("Mat chan not found in spike2", spike2_file, f"chan_metadata/{session_str}.xlsx", raise_excpt=False)
             all_chans = all_chans.loc[~all_chans["chan_num"].isna()]
                 # print(all_chans)
                 # raise Exception("Stop")
             if all_chans.empty:
-                error_report.report_error("Empty channels after merge", spike2_file)
+                error_report.report_error("Empty channels after merge", spike2_file, f"chan_metadata/{session_str}.xlsx")
             if all_chans.duplicated("chan_num").any():
-                error_report.report_error("Duplicated spike2 channels", spike2_file, False)
+                error_report.report_error("Duplicated spike2 channels", spike2_file, f"chan_metadata/{session_str}.xlsx", raise_excpt=False)
             if all_chans.duplicated("mat_key").any():
-                error_report.report_error("Duplicated spike2 channels", spike2_file, False)
+                error_report.report_error("Duplicated spike2 channels", spike2_file, f"chan_metadata/{session_str}.xlsx", raise_excpt=False)
             all_chans=all_chans.loc[~(all_chans.duplicated("chan_num", keep=False) | all_chans.duplicated("mat_key", keep=False))]
             all_chans["chan_num"] = all_chans["chan_num"].astype(int)
-            all_chans["is_APO"] = all_chans["is_APO"].astype(bool)
-            all_chans["has_swa"] = all_chans["has_swa"].astype(bool)
+            # all_chans["is_APO"] = all_chans["is_APO"].astype(bool)
+            # all_chans["has_swa"] = all_chans["has_swa"].astype(bool)
             
 
             if all_chans.loc[all_chans["chan_group"] == "EEGIpsi"].empty:
@@ -162,13 +166,6 @@ async def process_rat_session(session_ds: xr.Dataset, session_index):
             all_chans["common_duration"] =  all_chans["common_duration"].ffill().bfill()
 
                 
-            # if "__error__" in all_chans.columns or "_has_error" in all_chans.columns:
-            #     if "_has_error" in all_chans.columns:
-            #         all_chans.to_excel("all_chans_error.xlsx")
-            #         raise Exception("Stop2")
-            #         # AccepTableError(all_chans["__error__"].iat[0], spike2_file, all_chans.loc[all_chans["_has_error"]]["chan_name"])
-            #     raise AccepTableError(all_chans["__error__"].iat[0], spike2_file)
-            
             all_chans["chan_name_normalized"] = all_chans["chan_name"].str.translate(str.maketrans('', '', "_-/ "))
             if all_chans["chan_name_normalized"].duplicated().any():
                 error_report.report_error("Not unique normalized names...", spike2_file)
@@ -307,21 +304,18 @@ async def get_rats_combined_data(analysis_ds: xr.Dataset) -> Tuple[xr.DataArray,
                 res[v] = res[v].astype(str)
         return res
 
-    pd.DataFrame(acceptable_errors).to_excel(base_result_path/"all_known_errors_rats.xlsx", index=False)
     all_welch = (await checkpoint_xarray(combine_welch, f"combined_welch.zarr", f"combined_welch", 0))()
     all_coh = (await checkpoint_xarray(combine_coherence, f"combined_coh.zarr", f"combined_coh", 0))()
     all_meta: xr.Dataset = (await checkpoint_xarray(combine_meta, f"combined_meta.zarr", f"combined_meta", 0))()
     all_nt = (await checkpoint_xarray(combine_neuron_types, f"combined_nt.zarr", f"combined_nt", 0))()
-    n_per_grp = all_meta.to_dataframe().reset_index().groupby(["is_APO", "subject", "session_grp"])["has_swa"].nunique()
-    for _, row in n_per_grp.loc[n_per_grp!=2].reset_index().iterrows():
-        if not row["is_APO"]:
-            error_report.report_error("No swa session", row["subject"]+"--"+row["session_grp"], False)
     return all_welch, all_coh, all_meta, all_nt
 
 
 async def process_rats_data():
     analysis_ds: xr.Dataset = (await checkpoint_xarray(get_session_info, "analysis_files.zarr",  "files", 0))()
     analysis_ds = analysis_ds.sel(session=(analysis_ds["mat_file"]!="").any(["signal_type", "structure"]))
+    if analysis_ds[["session"]].to_dataframe().reset_index()["session"].duplicated().any():
+        raise Exception("Not unique sessions")
     # print(analysis_ds)
     # raise Exception("Stop")
     analysis_ds = analysis_ds.sortby("session").assign_coords(session_index=("session", np.arange(analysis_ds.sizes["session"]))).set_coords(analysis_ds.data_vars)
@@ -335,7 +329,11 @@ async def process_rats_data():
     # print(neuron_types)
     # print(all_meta.to_dataframe().reset_index()["condition"].unique())
     # print(analysis_ds.drop_dims(["signal_type", "structure"]))
-    channel_metadata = xr_merge(all_meta.drop_vars(["condition", "is_APO","has_swa", "session", "session_grp", "spike2_file", "subject", "mat_date", "segment_index"]), analysis_ds.drop_dims(["signal_type", "structure"]), how="left", on=["session_index"])
+    channel_metadata = xr_merge(all_meta, analysis_ds.drop_dims(["signal_type", "structure"]), how="left", on=["session_index"])
+    n_per_grp = channel_metadata.to_dataframe().reset_index().groupby(["is_APO", "subject", "session_grp", "condition"])["has_swa"].nunique()
+    for _, row in n_per_grp.loc[n_per_grp!=2].reset_index().iterrows():
+        if not row["is_APO"]:
+            error_report.report_error("No swa session", row["condition"] + "--" + row["subject"]+"--"+row["session_grp"], raise_excpt=False)
     channel_metadata = xr_merge(channel_metadata, neuron_types, how="left", on=["session_grp", "subject", "chan_name_normalized"])
     channel_metadata["has_swa"] = channel_metadata["has_swa"].astype(bool)
     channel_metadata["neuron_type"] = channel_metadata["neuron_type"].fillna("").astype(str)
@@ -461,36 +459,193 @@ async def process_monkey_data():
     # print(ds)
     return ds
     
+
+def compute_human_nonstn_raw_welch(path):
+    from scipy.io import loadmat
+    data = loadmat(human_basefolder/path, squeeze_me=True, variable_names=["MUA"])["MUA"]
+    fs, start = 48000, 0 #To change
+    data = xr.DataArray(data.flatten(), dims="t")
+    data["t"] = np.arange(data.sizes["t"])/fs +start
+    data["t"].attrs["fs"] = fs
+    bua = compute_bua(data)
+    ffts = compute_scaled_fft(bua).sel(f=slice(None, 120))
+    pwelch = (np.abs(ffts)**2).mean("t")
+    return pwelch
+
+def compute_human_nonstn_unit_welch(path):
+    from scipy.io import loadmat
+    data = loadmat(human_basefolder/path, squeeze_me=True, variable_names=["SUA"])["SUA"]
+    data = spiketimes_to_continuous(data)
+    ffts = compute_scaled_fft(data).sel(f=slice(None, 120))
+    pwelch = (np.abs(ffts)**2).mean("t")
+    return pwelch
+
+async def process_nonstn_human_data():
+    non_stn_folder = human_basefolder / "HumanData4review"
+    def get_files():
+        non_stn_files = [str(f.relative_to(human_basefolder)) for f in non_stn_folder.glob("**/unit*.mat")]
+        non_stn_df = pd.DataFrame()
+        non_stn_df["path"] = non_stn_files
+        non_stn_df[["structure", "session", "electrode", "unit"]] = non_stn_df["path"].str.extract("HumanData4review/(.*)/(.*)/(.*)/unit(\d+)\.mat")
+        non_stn_df = non_stn_df.loc[~non_stn_df["structure"].str.contains("STN")]
+        return non_stn_df
+    non_stn_df = (await checkpoint_excel(get_files, f"humans/nonstnfiles.xls", "nonstnfiles", 0))()
+    non_stn_df["condition"] = "Park"
+    non_stn_df["raw_id"] = non_stn_df["structure"] + "--" + non_stn_df["session"].astype(str) + "--" + non_stn_df["electrode"].astype(str)
+    non_stn_df["subject"] = non_stn_df["structure"] + "--" + non_stn_df["session"].astype(str)
+    non_stn_df["neuron_id"] = non_stn_df["raw_id"]+"--"+non_stn_df["unit"].astype(str)
+    non_stn_raw = (non_stn_df.drop_duplicates("raw_id").drop(columns=["neuron_id", "unit"])).sort_values("raw_id")
+    non_stn_df = non_stn_df.drop(columns="raw_id")
+
+    all_nonstn_raw = {}
+    async def handle_raw(path, raw_id, ind):
+        from functools import partial
+        res = await checkpoint_xarray(partial(compute_human_nonstn_raw_welch, path), f"humans/raw_pwelch/{raw_id}.xr.zarr", "raw_humans_pwelch", ind)
+        all_nonstn_raw[raw_id] = res
+
+    async with anyio.create_task_group() as tg:
+        for i, row in non_stn_raw.reset_index(drop=True).iterrows():
+            tg.start_soon(handle_raw, row["path"], row["raw_id"], i)
+        
+    all_nonstn_units = {}
+    async def handle_units(path, neuron_id, ind):
+        from functools import partial
+        res = await checkpoint_xarray(partial(compute_human_nonstn_unit_welch, path), f"humans/unit_pwelch/{neuron_id}.xr.zarr", "unit_humans_pwelch", ind)
+        all_nonstn_units[neuron_id] = res
+
+    async with anyio.create_task_group() as tg:
+        for i, row in non_stn_df.reset_index(drop=True).iterrows():
+            tg.start_soon(handle_units, row["path"], row["neuron_id"], i)
+
+    def combine_raw_welch() -> xr.DataArray:
+        all = []
+        for k, a in all_nonstn_raw.items():
+            ar: xr.DataArray = a().compute().assign_coords(raw_id=k, sig_type="bua")
+            all.append(ar)
+        res = xr.concat(all, dim="channel")
+        return res
+    
+    def combine_neuron_welch() -> xr.DataArray:
+        all = []
+        for k, a in all_nonstn_units.items():
+            ar: xr.DataArray = a().compute().assign_coords(neuron_id=k, sig_type="neuron")
+            all.append(ar)
+        res = xr.concat(all, dim="channel")
+        return res
+    print(non_stn_df)
+    print(non_stn_df.to_xarray().drop_vars("index").rename_dims(index="channel"))
+    all_welch_raw = (await checkpoint_xarray(combine_raw_welch, f"humans/combined_raw_welch.zarr", f"humans_combined_raw_welch", 0))()
+    raw_ds = non_stn_raw.to_xarray().drop_vars("index").rename_dims(index="channel")
+    raw_ds = xr_merge(all_welch_raw.to_dataset(name="welch"), raw_ds.set_coords(raw_ds.data_vars), on="raw_id", how="left")["welch"]
+    all_neuron_welch = (await checkpoint_xarray(combine_neuron_welch, f"humans/combined_neuron_welch.zarr", f"humans_combined_neuron_welch", 0))()
+    neuron_ds = non_stn_df.to_xarray().drop_vars("index").rename_dims(index="channel")
+    neuron_ds = xr_merge(all_neuron_welch.to_dataset(name="welch"), neuron_ds.set_coords(neuron_ds.data_vars), on="neuron_id", how="left")["welch"]
+    ds = xr.concat([raw_ds.rename(raw_id="id").drop_vars("path"), neuron_ds.rename(neuron_id="id").drop_vars(["unit", "path"])], dim="channel")
+    return ds
+
+    
+async def process_stn_human_data():
+    non_stn_folder = human_basefolder / "HumanData4review"
+    def get_files():
+        non_stn_files = [str(f.relative_to(human_basefolder)) for f in non_stn_folder.glob("**/unit*.mat")]
+        non_stn_df = pd.DataFrame()
+        non_stn_df["path"] = non_stn_files
+        non_stn_df[["structure", "session", "electrode", "unit"]] = non_stn_df["path"].str.extract("HumanData4review/(.*)/(.*)/(.*)/unit(\d+)\.mat")
+        non_stn_df = non_stn_df.loc[~non_stn_df["structure"].str.contains("STN")]
+        return non_stn_df
+    non_stn_df = (await checkpoint_excel(get_files, f"humans/nonstnfiles.xls", "nonstnfiles", 0))()
+    non_stn_df["condition"] = "Park"
+    non_stn_df["raw_id"] = non_stn_df["structure"] + "--" + non_stn_df["session"].astype(str) + "--" + non_stn_df["electrode"].astype(str)
+    non_stn_df["subject"] = non_stn_df["structure"] + "--" + non_stn_df["session"].astype(str)
+    non_stn_df["neuron_id"] = non_stn_df["raw_id"]+"--"+non_stn_df["unit"].astype(str)
+    non_stn_raw = (non_stn_df.drop_duplicates("raw_id").drop(columns=["neuron_id", "unit"])).sort_values("raw_id")
+    non_stn_df = non_stn_df.drop(columns="raw_id")
+
+    all_nonstn_raw = {}
+    async def handle_raw(path, raw_id, ind):
+        from functools import partial
+        res = await checkpoint_xarray(partial(compute_human_nonstn_raw_welch, path), f"humans/raw_pwelch/{raw_id}.xr.zarr", "raw_humans_pwelch", ind)
+        all_nonstn_raw[raw_id] = res
+
+    async with anyio.create_task_group() as tg:
+        for i, row in non_stn_raw.reset_index(drop=True).iterrows():
+            tg.start_soon(handle_raw, row["path"], row["raw_id"], i)
+        
+    all_nonstn_units = {}
+    async def handle_units(path, neuron_id, ind):
+        from functools import partial
+        res = await checkpoint_xarray(partial(compute_human_nonstn_unit_welch, path), f"humans/unit_pwelch/{neuron_id}.xr.zarr", "unit_humans_pwelch", ind)
+        all_nonstn_units[neuron_id] = res
+
+    async with anyio.create_task_group() as tg:
+        for i, row in non_stn_df.reset_index(drop=True).iterrows():
+            tg.start_soon(handle_units, row["path"], row["neuron_id"], i)
+
+    def combine_raw_welch() -> xr.DataArray:
+        all = []
+        for k, a in all_nonstn_raw.items():
+            ar: xr.DataArray = a().compute().assign_coords(raw_id=k, sig_type="bua")
+            all.append(ar)
+        res = xr.concat(all, dim="channel")
+        return res
+    
+    def combine_neuron_welch() -> xr.DataArray:
+        all = []
+        for k, a in all_nonstn_units.items():
+            ar: xr.DataArray = a().compute().assign_coords(neuron_id=k, sig_type="neuron")
+            all.append(ar)
+        res = xr.concat(all, dim="channel")
+        return res
+    print(non_stn_df)
+    print(non_stn_df.to_xarray().drop_vars("index").rename_dims(index="channel"))
+    all_welch_raw = (await checkpoint_xarray(combine_raw_welch, f"humans/combined_raw_welch.zarr", f"humans_combined_raw_welch", 0))()
+    raw_ds = non_stn_raw.to_xarray().drop_vars("index").rename_dims(index="channel")
+    raw_ds = xr_merge(all_welch_raw.to_dataset(name="welch"), raw_ds.set_coords(raw_ds.data_vars), on="raw_id", how="left")["welch"]
+    all_neuron_welch = (await checkpoint_xarray(combine_neuron_welch, f"humans/combined_neuron_welch.zarr", f"humans_combined_neuron_welch", 0))()
+    neuron_ds = non_stn_df.to_xarray().drop_vars("index").rename_dims(index="channel")
+    neuron_ds = xr_merge(all_neuron_welch.to_dataset(name="welch"), neuron_ds.set_coords(neuron_ds.data_vars), on="neuron_id", how="left")["welch"]
+    ds = xr.concat([raw_ds.rename(raw_id="id").drop_vars("path"), neuron_ds.rename(neuron_id="id").drop_vars(["unit", "path"])], dim="channel")
+    return ds
+    
+
+async def process_human_data():
+    return await process_nonstn_human_data()
+    # from pipeline_fct.humans import get_human_metadata
+    # metadata = (await checkpoint_excel(lambda: get_human_metadata(human_basefolder), f"humans/metadata.xls", "human_metadata", 0))()
+    # print(metadata)
+
+
 async def main():
     from pipeline_helper import _save_xarray
     rat_welch, rat_coh = await process_rats_data()
     _save_xarray(rat_welch, base_result_path/"rat_welch.zarr")
     _save_xarray(rat_coh, base_result_path/"rat_coh.zarr")
-    pd.DataFrame(acceptable_errors).to_excel(base_result_path/"known_errors_rats.xlsx", index=False)
     monkey_welch = await process_monkey_data()
-
+    human_welch = await process_human_data()
     #Probably some saving here too
     common_coords = ["f", "sig_type", "condition", "structure", "species", "neuron_type", "subject"]
     common_rat_welch = (
-        rat_welch.assign_coords(species="Rat").where(~(rat_welch["has_swa"] | rat_welch["is_APO"]), drop=True)
+        rat_welch.assign_coords(species="Rat").where(~(rat_welch["has_swa"] | rat_welch["is_APO"]) & rat_welch["structure"].isin(["GPe", "STN", "STR"]), drop=True)
         .drop_vars(k for k in rat_welch.coords if not k in common_coords)
         
     )
     common_monkey_welch = monkey_welch.assign_coords(species="Monkey", neuron_type="").drop_vars(k for k in monkey_welch.coords if not k in common_coords)
     common_monkey_welch["condition"] = xr.where(common_monkey_welch["condition"]=="healthy", "CTL", "Park")
     common_monkey_welch["structure"] = xr.where(common_monkey_welch["structure"]=="MSN", "STR", common_monkey_welch["structure"])
-    all_species_welch = xr.concat([common_monkey_welch, common_rat_welch], dim="channel")
+
+    common_human_welch = human_welch.assign_coords(species="human", neuron_type="").drop_vars(["session", "electrode", "id"])
+    common_human_welch["structure"] = xr.where(common_human_welch["structure"]=="MSN", "STR", common_human_welch["structure"])
+
+
+    all_species_welch = xr.concat([common_monkey_welch, common_rat_welch, common_human_welch], dim="channel")
     for c in all_species_welch.coords:
         if all_species_welch[c].dtype==object:
             all_species_welch[c] = all_species_welch[c].astype(str)
     # print(all_species_welch)
     _save_xarray(all_species_welch, base_result_path/"all_species_welch.zarr")
     # print(all_species_welch.to_dataset(name="welch").groupby(common_coords[1:]).apply(lambda d: xr.DataArray(d.sizes["channel"])))
-    pd.DataFrame(acceptable_errors).to_excel(base_result_path/"all_known_errors.xlsx", index=False)
 if __name__ == "__main__":
     try:
         anyio.run(main, backend="trio")
     finally:
-        for bar in error_groups.values():
-            bar.close()
         pipeline_helper.close()

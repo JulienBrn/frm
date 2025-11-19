@@ -45,7 +45,7 @@ def get_smrx_metadata(smrx_paths: List[Path]) -> pd.DataFrame:
     spike2df["spike2_file"] = smrx_paths
     spike2df["condition"] = [ret_condition[p.parts[0]] for p in smrx_paths]
     spike2df["subject"] = [p.parts[1] for p in smrx_paths]
-    spike2df["is_APO"] = spike2df["subject"].str.lower().str.contains("apo")
+    spike2df["is_APO"] = False
     spike2df["subject"] = spike2df["subject"].str.replace("(Apo)", "").str.replace(" ", "")
 
     def get_sessions_and_segment(stem):
@@ -99,13 +99,14 @@ def get_mat_df(xr_mats: xr.DataArray, base_folder: Path):
                     'mat_key': key,
                     'chan_num': channel_num
                 })
-    res =  pd.DataFrame(rows, columns=["mat_path", "mat_key", "chan_num"]).merge(df, how="left", on="mat_path")
+    res =  pd.DataFrame(rows, columns=["mat_path", "mat_key", "chan_num"]).merge(df[["structure", "signal_type", "mat_path"]], how="left", on="mat_path")
     res["chan_num"] = res["chan_num"].astype('Int64')
     return res
 
-def may_match(spike2: pd.DataFrame, mat: pd.DataFrame, mat_basefolder: Path, spike2_file: Path):
+def may_match(spike2: pd.Series, mat: pd.Series, mat_basefolder: Path, spike2_file: Path):
     chan = int(spike2["chan_num"])
-
+    if spike2["chan_type"] not in ["Adc", "EventRise"]:
+       return False
     if spike2["physical_channel"] >= 0 and mat["signal_type"]=="raw" and spike2["chan_type"] == "Adc":
         if (pd.notna(mat["chan_num"])  and spike2["chan_num"] == mat["chan_num"]) or mat["mat_key"].endswith(spike2["chan_name"]):
             with h5py.File(mat_basefolder / mat["mat_path"], 'r') as f:
