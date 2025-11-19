@@ -545,71 +545,104 @@ async def process_nonstn_human_data():
 
     
 async def process_stn_human_data():
-    non_stn_folder = human_basefolder / "HumanData4review"
+    stn_folder = human_basefolder / "Human_STN_Correct_All"
     def get_files():
-        non_stn_files = [str(f.relative_to(human_basefolder)) for f in non_stn_folder.glob("**/unit*.mat")]
-        non_stn_df = pd.DataFrame()
-        non_stn_df["path"] = non_stn_files
-        non_stn_df[["structure", "session", "electrode", "unit"]] = non_stn_df["path"].str.extract("HumanData4review/(.*)/(.*)/(.*)/unit(\d+)\.mat")
-        non_stn_df = non_stn_df.loc[~non_stn_df["structure"].str.contains("STN")]
-        return non_stn_df
-    non_stn_df = (await checkpoint_excel(get_files, f"humans/nonstnfiles.xls", "nonstnfiles", 0))()
-    non_stn_df["condition"] = "Park"
-    non_stn_df["raw_id"] = non_stn_df["structure"] + "--" + non_stn_df["session"].astype(str) + "--" + non_stn_df["electrode"].astype(str)
-    non_stn_df["subject"] = non_stn_df["structure"] + "--" + non_stn_df["session"].astype(str)
-    non_stn_df["neuron_id"] = non_stn_df["raw_id"]+"--"+non_stn_df["unit"].astype(str)
-    non_stn_raw = (non_stn_df.drop_duplicates("raw_id").drop(columns=["neuron_id", "unit"])).sort_values("raw_id")
-    non_stn_df = non_stn_df.drop(columns="raw_id")
-
-    all_nonstn_raw = {}
-    async def handle_raw(path, raw_id, ind):
-        from functools import partial
-        res = await checkpoint_xarray(partial(compute_human_nonstn_raw_welch, path), f"humans/raw_pwelch/{raw_id}.xr.zarr", "raw_humans_pwelch", ind)
-        all_nonstn_raw[raw_id] = res
-
-    async with anyio.create_task_group() as tg:
-        for i, row in non_stn_raw.reset_index(drop=True).iterrows():
-            tg.start_soon(handle_raw, row["path"], row["raw_id"], i)
+        from scipy.io import loadmat
+        all_stn_metadata = []
+        for f in stn_folder.glob("all_Sorting_data*.mat"):
+            data = loadmat(f, squeeze_me=True)
+            data = data[next(k for k in data.keys() if not k.startswith("__"))]
+            df = pd.DataFrame(data)
+            df = df.where(df.astype(str) != "[]", np.nan)
+            df = df.loc[:, df.notna().any(axis=0)]
+            df.columns = ["folder"]+ [k.replace("Isolaton", "isolation").lower() for k in df.iloc[0, 1:].astype(str).tolist()]
+            df = df.iloc[1:].reset_index(drop=True)
+            df["folder"] = np.where(df["folder"].astype(str).str.match("^\d*$"), np.nan, df["folder"])
+            df["folder"] = df["folder"].ffill()
+            df = df.loc[df["file"].notna()]
+            all_stn_metadata.append(df)
+        df = pd.concat(all_stn_metadata)
+        df["path"] = str(stn_folder.relative_to(human_basefolder))+"/"+"STN_"+df["folder"].str.replace("\\", "/")+"/"+df["file"].str.replace(".map", ".mat")
+        df["unit_path"] = df["path"].apply(lambda p: str(Path(p).parent)) +"/"+("sorting results_" + df["path"].apply(lambda p: Path(p).parent.name) 
+                            + "-" + df["path"].apply(lambda p: Path(p).stem)+"-channel"+df["channel"].astype(str) + "-"
+                            +  "1.mat"
+        )
+        df["relfolder"] = df["path"].apply(lambda p: str(Path(p).parent))
         
-    all_nonstn_units = {}
-    async def handle_units(path, neuron_id, ind):
-        from functools import partial
-        res = await checkpoint_xarray(partial(compute_human_nonstn_unit_welch, path), f"humans/unit_pwelch/{neuron_id}.xr.zarr", "unit_humans_pwelch", ind)
-        all_nonstn_units[neuron_id] = res
+        stability_db = list(stn_folder.glob("**/stabilityDatabase*.mat"))
+        all_stability = []
+        for p in stability_db:
+            data = loadmat(human_basefolder/p, squeeze_me=True)['stabilityDatabase']
+            st_db_df = pd.DataFrame(data[1:])
+            st_db_df.columns=data[0]
+            st_db_df["relfolder"] = str(p.parent.relative_to(human_basefolder))
+            st_db_df["file"] = st_db_df.pop("file name")
+            all_stability.append(st_db_df)
+        all_stability = pd.concat(all_stability)
+        if all_stability.duplicated(["relfolder", "channel", "file"]).any():
+            raise Exception("problem")
+        all = pd.merge(df, all_stability, on=["relfolder", "channel", "file"], how="left")
+        
+        return all
+    stn_df = (await checkpoint_excel(get_files, f"humans/stnfiles.xls", "stnfiles", 0))()
+    # non_stn_df["condition"] = "Park"
+    # non_stn_df["raw_id"] = non_stn_df["structure"] + "--" + non_stn_df["session"].astype(str) + "--" + non_stn_df["electrode"].astype(str)
+    # non_stn_df["subject"] = non_stn_df["structure"] + "--" + non_stn_df["session"].astype(str)
+    # non_stn_df["neuron_id"] = non_stn_df["raw_id"]+"--"+non_stn_df["unit"].astype(str)
+    # non_stn_raw = (non_stn_df.drop_duplicates("raw_id").drop(columns=["neuron_id", "unit"])).sort_values("raw_id")
+    # non_stn_df = non_stn_df.drop(columns="raw_id")
 
-    async with anyio.create_task_group() as tg:
-        for i, row in non_stn_df.reset_index(drop=True).iterrows():
-            tg.start_soon(handle_units, row["path"], row["neuron_id"], i)
+    # all_nonstn_raw = {}
+    # async def handle_raw(path, raw_id, ind):
+    #     from functools import partial
+    #     res = await checkpoint_xarray(partial(compute_human_nonstn_raw_welch, path), f"humans/raw_pwelch/{raw_id}.xr.zarr", "raw_humans_pwelch", ind)
+    #     all_nonstn_raw[raw_id] = res
 
-    def combine_raw_welch() -> xr.DataArray:
-        all = []
-        for k, a in all_nonstn_raw.items():
-            ar: xr.DataArray = a().compute().assign_coords(raw_id=k, sig_type="bua")
-            all.append(ar)
-        res = xr.concat(all, dim="channel")
-        return res
+    # async with anyio.create_task_group() as tg:
+    #     for i, row in non_stn_raw.reset_index(drop=True).iterrows():
+    #         tg.start_soon(handle_raw, row["path"], row["raw_id"], i)
+        
+    # all_nonstn_units = {}
+    # async def handle_units(path, neuron_id, ind):
+    #     from functools import partial
+    #     res = await checkpoint_xarray(partial(compute_human_nonstn_unit_welch, path), f"humans/unit_pwelch/{neuron_id}.xr.zarr", "unit_humans_pwelch", ind)
+    #     all_nonstn_units[neuron_id] = res
+
+    # async with anyio.create_task_group() as tg:
+    #     for i, row in non_stn_df.reset_index(drop=True).iterrows():
+    #         tg.start_soon(handle_units, row["path"], row["neuron_id"], i)
+
+    # def combine_raw_welch() -> xr.DataArray:
+    #     all = []
+    #     for k, a in all_nonstn_raw.items():
+    #         ar: xr.DataArray = a().compute().assign_coords(raw_id=k, sig_type="bua")
+    #         all.append(ar)
+    #     res = xr.concat(all, dim="channel")
+    #     return res
     
-    def combine_neuron_welch() -> xr.DataArray:
-        all = []
-        for k, a in all_nonstn_units.items():
-            ar: xr.DataArray = a().compute().assign_coords(neuron_id=k, sig_type="neuron")
-            all.append(ar)
-        res = xr.concat(all, dim="channel")
-        return res
-    print(non_stn_df)
-    print(non_stn_df.to_xarray().drop_vars("index").rename_dims(index="channel"))
-    all_welch_raw = (await checkpoint_xarray(combine_raw_welch, f"humans/combined_raw_welch.zarr", f"humans_combined_raw_welch", 0))()
-    raw_ds = non_stn_raw.to_xarray().drop_vars("index").rename_dims(index="channel")
-    raw_ds = xr_merge(all_welch_raw.to_dataset(name="welch"), raw_ds.set_coords(raw_ds.data_vars), on="raw_id", how="left")["welch"]
-    all_neuron_welch = (await checkpoint_xarray(combine_neuron_welch, f"humans/combined_neuron_welch.zarr", f"humans_combined_neuron_welch", 0))()
-    neuron_ds = non_stn_df.to_xarray().drop_vars("index").rename_dims(index="channel")
-    neuron_ds = xr_merge(all_neuron_welch.to_dataset(name="welch"), neuron_ds.set_coords(neuron_ds.data_vars), on="neuron_id", how="left")["welch"]
-    ds = xr.concat([raw_ds.rename(raw_id="id").drop_vars("path"), neuron_ds.rename(neuron_id="id").drop_vars(["unit", "path"])], dim="channel")
-    return ds
+    # def combine_neuron_welch() -> xr.DataArray:
+    #     all = []
+    #     for k, a in all_nonstn_units.items():
+    #         ar: xr.DataArray = a().compute().assign_coords(neuron_id=k, sig_type="neuron")
+    #         all.append(ar)
+    #     res = xr.concat(all, dim="channel")
+    #     return res
+    # print(non_stn_df)
+    # print(non_stn_df.to_xarray().drop_vars("index").rename_dims(index="channel"))
+    # all_welch_raw = (await checkpoint_xarray(combine_raw_welch, f"humans/combined_raw_welch.zarr", f"humans_combined_raw_welch", 0))()
+    # raw_ds = non_stn_raw.to_xarray().drop_vars("index").rename_dims(index="channel")
+    # raw_ds = xr_merge(all_welch_raw.to_dataset(name="welch"), raw_ds.set_coords(raw_ds.data_vars), on="raw_id", how="left")["welch"]
+    # all_neuron_welch = (await checkpoint_xarray(combine_neuron_welch, f"humans/combined_neuron_welch.zarr", f"humans_combined_neuron_welch", 0))()
+    # neuron_ds = non_stn_df.to_xarray().drop_vars("index").rename_dims(index="channel")
+    # neuron_ds = xr_merge(all_neuron_welch.to_dataset(name="welch"), neuron_ds.set_coords(neuron_ds.data_vars), on="neuron_id", how="left")["welch"]
+    # ds = xr.concat([raw_ds.rename(raw_id="id").drop_vars("path"), neuron_ds.rename(neuron_id="id").drop_vars(["unit", "path"])], dim="channel")
+    # return ds
     
 
 async def process_human_data():
-    return await process_nonstn_human_data()
+    res = await process_nonstn_human_data()
+    await process_stn_human_data()
+    return res
     # from pipeline_fct.humans import get_human_metadata
     # metadata = (await checkpoint_excel(lambda: get_human_metadata(human_basefolder), f"humans/metadata.xls", "human_metadata", 0))()
     # print(metadata)
