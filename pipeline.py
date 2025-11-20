@@ -36,8 +36,6 @@ import warnings
 # Suppress warnings with a matching message regex
 warnings.filterwarnings("ignore", message=".*Increasing number of chunks by factor of.*")
 
-# client = dask.distributed.Client(processes=False,  dashboard_address=":8787")
-# print("Dashboard running at:", client.dashboard_link)
 client= None
 
 spike2files_basefolder = Path("/media/julienb/T7 Shield/Revue-FRM/RawData/Rats/Version-RAW-2-Nico/")
@@ -48,27 +46,10 @@ base_result_path = Path("/media/julienb/T7 Shield/Revue-FRM/AnalysisData8/")
 
 set_base_result_path(base_result_path)
 set_limiter(5)
-# error_groups = {}
-# acceptable_errors = []
+
 
 if __name__ == "__main__": #To protect against multiprocessing
     error_report = ErrorReport(base_result_path/"reported_errors.tsv")
-# class AccepTableError(Exception): 
-#     def __init__(self, group, info):
-#         super().__init__(group)
-#         if not group in error_groups:
-#             error_groups[group] = tqdm.tqdm(desc=f"{RED}Error {group}{RESET}", leave=True)
-#         acceptable_errors.append(dict(group=group, info=info))
-#         error_groups[group].update(1)
-#         error_groups[group].refresh()
-
-
-
-
-
-# class ErrorReport:
-#     def __init__(self, file_obj):
-#         self.file_obj = file_obj
 
 
 
@@ -261,7 +242,6 @@ async def get_rats_combined_data(analysis_ds: xr.Dataset) -> Tuple[xr.DataArray,
                 tg.start_soon(add_neuron_types, session_ds, meta, session_ds["session_index"].item())
                 await anyio.sleep(0)
 
-
     def combine_welch():
         all = []
         for k, (a, _, meta) in results.items():
@@ -303,6 +283,8 @@ async def get_rats_combined_data(analysis_ds: xr.Dataset) -> Tuple[xr.DataArray,
             if res[v].dtype==object:
                 res[v] = res[v].astype(str)
         return res
+    
+    
 
     all_welch = (await checkpoint_xarray(combine_welch, f"combined_welch.zarr", f"combined_welch", 0))()
     all_coh = (await checkpoint_xarray(combine_coherence, f"combined_coh.zarr", f"combined_coh", 0))()
@@ -460,10 +442,10 @@ async def process_monkey_data():
     return ds
     
 
-def compute_human_nonstn_raw_welch(path):
+def compute_human_nonstn_raw_welch(path, fs):
     from scipy.io import loadmat
     data = loadmat(human_basefolder/path, squeeze_me=True, variable_names=["MUA"])["MUA"]
-    fs, start = 48000, 0 #To change
+    start = 0 
     data = xr.DataArray(data.flatten(), dims="t")
     data["t"] = np.arange(data.sizes["t"])/fs +start
     data["t"].attrs["fs"] = fs
@@ -498,14 +480,19 @@ async def process_nonstn_human_data():
     non_stn_df = non_stn_df.drop(columns="raw_id")
 
     all_nonstn_raw = {}
-    async def handle_raw(path, raw_id, ind):
+    async def handle_raw(path, raw_id, session, ind):
         from functools import partial
-        res = await checkpoint_xarray(partial(compute_human_nonstn_raw_welch, path), f"humans/raw_pwelch/{raw_id}.xr.zarr", "raw_humans_pwelch", ind)
+        year = int(session[:4])
+        if year >=2015:
+            fs = 48076.92337036133
+        else:
+            fs = 44000
+        res = await checkpoint_xarray(partial(compute_human_nonstn_raw_welch, path, fs), f"humans/raw_pwelch/{raw_id}.xr.zarr", "raw_humans_pwelch", ind)
         all_nonstn_raw[raw_id] = res
 
     async with anyio.create_task_group() as tg:
         for i, row in non_stn_raw.reset_index(drop=True).iterrows():
-            tg.start_soon(handle_raw, row["path"], row["raw_id"], i)
+            tg.start_soon(handle_raw, row["path"], row["raw_id"], row["session"], i)
         
     all_nonstn_units = {}
     async def handle_units(path, neuron_id, ind):
@@ -555,13 +542,14 @@ def compute_human_stn_raw_welch(path, start_t, end_t, channel):
     bua = compute_bua(data)
     ffts = compute_scaled_fft(bua).sel(f=slice(None, 120))
     pwelch = (np.abs(ffts)**2).mean("t")
+    pwelch.attrs["orig_fs"] = fs
     return pwelch
 
-def compute_human_stn_unit_welch(path, unit_list, start_t, end_t):
+def compute_human_stn_unit_welch(path, unit_list, start_t, end_t, fs):
     from scipy.io import loadmat
     mat_data = loadmat(str(human_basefolder/path), squeeze_me=True, mat_dtype=True)
     initial_sorting_results = pd.DataFrame(mat_data["sortingResults"]["classifiedSpikes"].item()[:, :2], columns=["unit", "t"])
-    initial_sorting_results["t"] = initial_sorting_results["t"]/48076.92337036133
+    initial_sorting_results["t"] = initial_sorting_results["t"]/fs
     sorting_results = initial_sorting_results.loc[(initial_sorting_results["t"] >= start_t) & (initial_sorting_results["t"] <= end_t)]
     
     arrays = []
@@ -655,8 +643,9 @@ async def process_stn_human_data():
         from functools import partial
         raw_id, path, unit_path, channel, start, end = (grp[k].iat[0] for k in ['raw_id', "path", "unit_path", "channel", "start", "end"])
         bua = await checkpoint_xarray(partial(compute_human_stn_raw_welch, path, start, end, channel), f"humans/raw_pwelch_stn/{raw_id}.xr.zarr", "raw_humans_pwelch_stn", ind)
+        fs = bua().attrs["orig_fs"]
         try:
-            neurons = await checkpoint_xarray(partial(compute_human_stn_unit_welch, unit_path, grp["unit"].tolist(), start, end), f"humans/unit_pwelch_stn/{raw_id}.xr.zarr", "unit_humans_pwelch_stn", ind)
+            neurons = await checkpoint_xarray(partial(compute_human_stn_unit_welch, unit_path, grp["unit"].tolist(), start, end, fs), f"humans/unit_pwelch_stn/{raw_id}.xr.zarr", "unit_humans_pwelch_stn", ind)
         except Exception:
              error_report.report_error("No spiketimes human stn", path, raise_excpt=False)
              return
