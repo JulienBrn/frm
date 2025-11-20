@@ -545,6 +545,11 @@ def compute_human_stn_raw_welch(path, start_t, end_t, channel):
     pwelch.attrs["orig_fs"] = fs
     return pwelch
 
+class tmpExcpt(Exception):
+    def __init__(self, msg, unit):
+        super().__init__(msg)
+        self.unit=unit
+
 def compute_human_stn_unit_welch(path, unit_list, start_t, end_t, fs):
     from scipy.io import loadmat
     mat_data = loadmat(str(human_basefolder/path), squeeze_me=True, mat_dtype=True)
@@ -561,6 +566,8 @@ def compute_human_stn_unit_welch(path, unit_list, start_t, end_t, fs):
             # print(f"{unit}, {start_t}, {end_t}")
             # print(sorting_results)
             # print(initial_sorting_results)
+            if spiketimes.size==0:
+                raise tmpExcpt("No spiketimes", unit)
             raise
         arrays.append(data)
     data = xr.concat(arrays, dim="channel")
@@ -646,8 +653,8 @@ async def process_stn_human_data():
         fs = bua().attrs["orig_fs"]
         try:
             neurons = await checkpoint_xarray(partial(compute_human_stn_unit_welch, unit_path, grp["unit"].tolist(), start, end, fs), f"humans/unit_pwelch_stn/{raw_id}.xr.zarr", "unit_humans_pwelch_stn", ind)
-        except Exception:
-             error_report.report_error("No spiketimes human stn", path, raise_excpt=False)
+        except tmpExcpt as e:
+             error_report.report_error("No spiketimes", path, e.unit, raise_excpt=False)
              return
             #  raise
         all_stn_raw[raw_id] = bua
@@ -701,17 +708,18 @@ async def process_human_data():
 async def main():
     from pipeline_helper import _save_xarray
     rat_welch, rat_coh = await process_rats_data()
-    _save_xarray(rat_welch, base_result_path/"rat_welch.zarr")
-    _save_xarray(rat_coh, base_result_path/"rat_coh.zarr")
+    # _save_xarray(rat_welch, base_result_path/"rat_welch.zarr")
+    # _save_xarray(rat_coh, base_result_path/"rat_coh.zarr")
     monkey_welch = await process_monkey_data()
     human_welch = await process_human_data()
     #Probably some saving here too
     common_coords = ["f", "sig_type", "condition", "structure", "species", "neuron_type", "subject"]
     common_rat_welch = (
-        rat_welch.assign_coords(species="Rat").where(~(rat_welch["has_swa"] | rat_welch["is_APO"]) & rat_welch["structure"].isin(["GPe", "STN", "STR"]), drop=True)
+        rat_welch.assign_coords(species="Rat").where(~(rat_welch["has_swa"] | rat_welch["is_APO"]), drop=True)
         .drop_vars(k for k in rat_welch.coords if not k in common_coords)
         
     )
+
     common_monkey_welch = monkey_welch.assign_coords(species="Monkey", neuron_type="").drop_vars(k for k in monkey_welch.coords if not k in common_coords)
     common_monkey_welch["condition"] = xr.where(common_monkey_welch["condition"]=="healthy", "CTL", "Park")
     common_monkey_welch["structure"] = xr.where(common_monkey_welch["structure"]=="MSN", "STR", common_monkey_welch["structure"])
@@ -723,11 +731,33 @@ async def main():
 
 
     all_species_welch = xr.concat([common_monkey_welch, common_rat_welch, common_human_welch], dim="channel")
+
+    paired_coords = ["sig_type", "structure", "neuron_type"]
+    coord_pairs = [c+suffix for c in paired_coords for suffix in ["_1", "_2"]]
+    unpaired_coords = [c for c in common_coords if not c in paired_coords]
+    common_rat_coh = (
+        rat_coh.assign_coords(species="Rat").where(~(rat_coh["has_swa"] | rat_coh["is_APO"]), drop=True)
+        .drop_vars(k for k in rat_coh.coords if not k in unpaired_coords  and not k in coord_pairs)
+    )
+
+    all_species_coh = common_rat_coh
+
     for c in all_species_welch.coords:
         if all_species_welch[c].dtype==object:
             all_species_welch[c] = all_species_welch[c].astype(str)
-    # print(all_species_welch)
+    for c in all_species_coh.coords:
+        if all_species_coh[c].dtype==object:
+            all_species_coh[c] = all_species_coh[c].astype(str)
+
     _save_xarray(all_species_welch, base_result_path/"all_species_welch.zarr")
+    _save_xarray(all_species_coh, base_result_path/"all_species_coh.zarr")
+
+    errors = pd.read_csv(error_report.file, sep="\t")
+    errors.to_excel("errors.xlsx")
+    # all_species_welch["sig_type"] = all_species_welch["sig_type"].astype(object)
+    # all_species_coh["sig_type_1"] = all_species_coh["sig_type_1"].astype(object)
+    # all_species_welch.to_netcdf(base_result_path/"all_species_welch.h5", engine="netcdf4")
+    
     # print(all_species_welch.to_dataset(name="welch").groupby(common_coords[1:]).apply(lambda d: xr.DataArray(d.sizes["channel"])))
 if __name__ == "__main__":
     try:

@@ -1,5 +1,7 @@
 import os
 from pathlib import Path
+import markdown  # pip install markdown
+
 
 def build_tree(root_dir):
     """
@@ -35,13 +37,29 @@ def generate_html(tree, base_path=""):
     return html
 
 
-def generate_index_html(scan_dir, output_file="./index.html"):
+def load_description(md_file="processing_description.md"):
+    """
+    Load and convert the Markdown description to HTML.
+    Returns an empty string if file not found.
+    """
+    md_path = Path(md_file)
+    if not md_path.exists():
+        print(f"⚠️  No description file found at {md_path.resolve()}")
+        return ""
+    with open(md_path, "r", encoding="utf-8") as f:
+        md_text = f.read()
+    html_desc = markdown.markdown(md_text)
+    return html_desc
+
+
+def generate_index_html(scan_dir, output_file="./index.html", desc_file="processing_description.md"):
     """
     Generate an index.html in the current directory based on HTML files
-    found under scan_dir (recursively).
+    found under scan_dir (recursively), with a description section below.
     """
     tree = build_tree(scan_dir)
     html_tree = generate_html(tree, scan_dir)
+    description_html = load_description(desc_file)
 
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -78,11 +96,22 @@ def generate_index_html(scan_dir, output_file="./index.html"):
     strong {{
       color: #444;
     }}
+    .description {{
+      margin-top: 2em;
+      padding-top: 1em;
+      border-top: 2px solid #ccc;
+    }}
   </style>
 </head>
 <body>
   <h1>Figures Index</h1>
   {html_tree}
+  <div class="description">
+    <h2>Description</h2>
+    {description_html}
+  </div>
+  <h1>Errors</h1>
+  <a href="errors.xlsx"</a>
 </body>
 </html>
 """

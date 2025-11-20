@@ -77,12 +77,17 @@ def set_base_result_path(p: Path):
     global base_result_path
     base_result_path = Path(p)
 
+# def add_note_to_exception(exc, note):
+#     #Because we are currently using python 3.9 and we dont have add_note
+#     new_exc = exc.__class__(f"{exc}\nNote: {note}")
+#     new_exc.__cause__ = exc.__cause__
+#     new_exc.__context__ = exc.__context__
+#     return new_exc
+
 def add_note_to_exception(exc, note):
-    #Because we are currently using python 3.9 and we dont have add_note
-    new_exc = exc.__class__(f"{exc}\nNote: {note}")
-    new_exc.__cause__ = exc.__cause__
-    new_exc.__context__ = exc.__context__
-    return new_exc
+    msg = exc.args[0] if exc.args else str(exc)
+    exc.args = (f"{msg}\nNote: {note}",)
+    return exc
 
 def close():
     for bar in groups.values():
@@ -99,9 +104,12 @@ def in_runner_func(func, tmp_path, save_fn):
                 tmp_path.unlink()
         save_fn(res, tmp_path)
     except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
-        raise Exception(tb)
+        if e.__class__ == Exception:
+            import traceback
+            tb = traceback.format_exc()
+            raise Exception(tb)
+        else:
+            raise e
 
 from multiprocessing.reduction import ForkingPickler
 import io
