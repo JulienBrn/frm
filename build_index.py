@@ -107,7 +107,6 @@ def generate_index_html(scan_dir, output_file="./index.html", desc_file="process
   <h1>Figures Index</h1>
   {html_tree}
   <div class="description">
-    <h2>Description</h2>
     {description_html}
   </div>
   <h1>Errors</h1>
