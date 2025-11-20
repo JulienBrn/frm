@@ -111,7 +111,7 @@ def generate_index_html(scan_dir, output_file="./index.html", desc_file="process
     {description_html}
   </div>
   <h1>Errors</h1>
-  <a href="errors.xlsx"</a>
+  <a href="errors.xlsx">Excel error file</a>
 </body>
 </html>
 """
