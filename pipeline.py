@@ -740,14 +740,21 @@ async def main():
         .drop_vars(k for k in rat_coh.coords if not k in unpaired_coords  and not k in coord_pairs)
     )
 
-    all_species_coh = common_rat_coh
+    all_species_coh = xr.concat([common_rat_coh], dim="channel_pair")
 
     for c in all_species_welch.coords:
+        if len(all_species_welch[c].dims) ==0:
+            all_species_welch[c] = all_species_welch[c].broadcast_like(all_species_welch["channel"])
         if all_species_welch[c].dtype==object:
             all_species_welch[c] = all_species_welch[c].astype(str)
     for c in all_species_coh.coords:
+        # print(all_species_coh[c])
+        # print(type(all_species_coh[c]))
+        if len(all_species_coh[c].dims) ==0:
+            all_species_coh[c] = all_species_coh[c].broadcast_like(all_species_coh["channel_pair"])
         if all_species_coh[c].dtype==object:
             all_species_coh[c] = all_species_coh[c].astype(str)
+        
 
     _save_xarray(all_species_welch, base_result_path/"all_species_welch.zarr")
     _save_xarray(all_species_coh, base_result_path/"all_species_coh.zarr")
