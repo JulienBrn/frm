@@ -15,7 +15,7 @@ def build_tree(root_dir):
             subtree = build_tree(full_path)
             if subtree:  # Only include dirs that contain HTML files
                 tree[entry] = subtree
-        elif entry.endswith(".html"):
+        elif entry.endswith(".html") or entry.endswith(".xlsx"):
             tree[entry] = None
     return tree
 
@@ -30,7 +30,7 @@ def generate_html(tree, base_path=""):
             rel_path = os.path.join(base_path, name).replace("\\", "/")
             html += f'  <li><a href="{rel_path}">{name[:-5]}</a></li>\n'
         else:
-            html += f'  <li><strong>{name}</strong>\n'
+            html += f'  <li><details open><summary>{name}</summary>\n'
             html += generate_html(subtree, os.path.join(base_path, name))
             html += "  </li>\n"
     html += "</ul>\n"
@@ -104,7 +104,7 @@ def generate_index_html(scan_dir, output_file="./index.html", desc_file="process
   </style>
 </head>
 <body>
-  <h1>Figures Index</h1>
+  <h1>Data Index</h1>
   {html_tree}
   <div class="description">
     {description_html}
@@ -122,5 +122,5 @@ def generate_index_html(scan_dir, output_file="./index.html", desc_file="process
 
 if __name__ == "__main__":
     # Folder to scan (change if needed)
-    figures_dir = "./figures"
+    figures_dir = "./results"
     generate_index_html(figures_dir)
