@@ -9,7 +9,7 @@ import itables
 itables.init_notebook_mode(all_interactive=True)
 
 # %%
-def save_fig(fig: go.Figure, name: str, plot_type: str=None, sig_type: str=None, species: str=None, cond: str=None):
+def save_fig(fig: go.Figure, name: str, plot_type: str=None, sig_type: str=None, species: str=None, cond: str=None, baseline: str=None):
     path = Path("./results/figures")
     title = []
     if plot_type is not None:
@@ -18,6 +18,9 @@ def save_fig(fig: go.Figure, name: str, plot_type: str=None, sig_type: str=None,
     if sig_type is not None:
        path = path/sig_type.lower()
        title.append(sig_type.upper())
+    if baseline is not None:
+       path = path/baseline.lower()
+       title.append(baseline.capitalize())
     if species is not None:
        path = path/species.lower()
        title.append(species.capitalize())
@@ -40,7 +43,8 @@ def save_stats(arr: xr.DataArray, plot_type, subgroup):
     path.parent.mkdir(exist_ok=True, parents=True)
     df.to_excel(path, index=False)
 
-def xr_to_pd(ds, col):
+def xr_to_pd(ds:xr.Dataset, col):
+  ds = ds.drop_dims([d for d in ds.dims if not d in ds[col].dims])
   df = ds.to_dataframe().reset_index()
   df=df.loc[df[col].notna()]
   return df
@@ -91,24 +95,27 @@ display(all_welch)
 
 
 for d, grps in (all_welch, welch_groups), (all_coh, coh_groups):
+    rel_data = d["data"] - ((d["f"]-8) * (d["data"].sel(f=35)-d["data"].sel(f=8))/(35-8) + d["data"].sel(f=8))
+    d["data"] = xr.concat([d["data"].assign_coords(baseline="zero"), rel_data.assign_coords(baseline="interp(8, 35)")], dim="baseline")
     dim =d["condition"].dims[0]
     max_f = d["data"].sel(f=slice(8, 35)).idxmax("f")
     max_f = max_f.where((d["data"].sel(f=max_f) > d["data"].sel(f=max_f+1)) & (d["data"].sel(f=max_f) > d["data"].sel(f=max_f-1)))
     d["max_f"] = max_f
     auc = d["data"].sel(f=slice(8,35)).mean("f")
-    rel_auc = auc - (d["data"].sel(f=8) + d["data"].sel(f=35))/2
-    auc = xr.concat([auc.assign_coords(fagg_method="band_mean"), rel_auc.assign_coords(fagg_method="rel_band_mean")], dim="fagg_method")
     def rel_condition(d):
       ctl = d.where(d["condition"]=="CTL", drop=True)
       ret = (d - ctl.mean(dim)) / ctl.std(dim)
       return ret
-    # d["auc"].groupby([c for c in welch_groups if not c=="condition"]).map(rel_condition) doesnt work
+    #Because d["auc"].groupby([c for c in welch_groups if not c=="condition"]).map(rel_condition) does not work
     all = []
     for g, grp in auc.groupby([c for c in grps if not c=="condition"]):
        rc = rel_condition(grp)
        all.append(rc)
+
     
     d["auc"] = xr.concat([xr.concat(all, dim=dim).assign_coords(cond_norm="zscored"), auc.assign_coords(cond_norm="none")], dim="cond_norm")
+    d["max_f_pow"] = d["data"].sel(f=d["max_f"].fillna(8)).where(d["max_f"])
+    
 display(all_welch)
 
 # %%
@@ -146,42 +153,103 @@ for v in "auc", "max_f":
 
 
 # %%
-def compute_groups(d: xr.Dataset, groups: list):
+def compute_groups(d: xr.Dataset, groups: list, name):
     dim = d[groups[0]].dims[0]
     grp = d["data"].groupby(groups)
     res = xr.Dataset()
-    res["data"] = grp.mean()
+    res[name] = grp.mean()
+    # res["auc_"+name] = d["auc"].groupby(groups).mean()
     res["n_sigs"] =  grp.map(lambda x: xr.DataArray(x.sizes[dim])).fillna(0).astype(int)
     res["n_subjects"] = grp.apply(lambda x: xr.DataArray(len(np.unique(x["subject"])))).fillna(0).astype(int)
     res["sem"] = grp.std() / np.sqrt(res["n_sigs"])
-    res["n_max_f"] = d.groupby(groups+ ["max_f"]).apply(lambda d: xr.DataArray(d.sizes[dim])).fillna(0)
+    # res["n_max_f"] = d.groupby(groups+ ["max_f"]).apply(lambda d: xr.DataArray(d.sizes[dim])).fillna(0)
+    all = []
+    for b in d["baseline"].to_numpy():
+        all.append(d.sel(baseline=b).groupby(groups+ ["max_f"]).apply(lambda d: xr.DataArray(d.sizes[dim])).fillna(0))
+    res["n_max_f"] = xr.concat(all, dim="baseline")
     res["n_max_f"] = res["n_max_f"].where(res["n_max_f"].sum("max_f")>0)
     res["%_max_f"] = res["n_max_f"]/res["n_max_f"].sum("max_f")
+    res["max_f_"+name] = d.set_coords("max_f")["max_f_pow"].groupby(groups+ ["max_f"]).mean()
     return res
 
-welch_grouped = compute_groups(all_welch, welch_groups)
-coh_grouped = compute_groups(all_coh, coh_groups)
+welch_grouped = compute_groups(all_welch, welch_groups, "welch")
+coh_grouped = compute_groups(all_coh, coh_groups, "coh")
 display(welch_grouped)
 display(coh_grouped)
 
 # %%
+d_coh = coh_grouped.sel(sig_type_1="eeg").rename(sig_group_2="sig_group", sig_type_2="sig_type")
+for name, d in ("coh", d_coh), ("welch", welch_grouped):
+  for b in d["baseline"].to_numpy():
+    for st in d["sig_type"].to_numpy():
+      if st=="eeg":
+        continue
+      selection = "" if name=="welch" else " rel EEG"
+      fig = filter_facet_categories(line_error_bands)(xr_to_pd(d.sel(sig_type=[st], baseline=b), name), 
+                    x="f", y=name, color="condition", facet_row="sig_group", facet_col="species", error_y="sem",
+                    hover_data=["n_sigs", "n_subjects", "sem"], 
+                    category_orders=dict(condition=condition_order, sig_group=sig_group_order),
+                    subplot_height=200, subplot_width=400,
+                    )
+      save_fig(fig, name="Power Spectrum"+selection, plot_type=name, sig_type=st, baseline=b)
+      fig = filter_facet_categories(line_error_bands)(xr_to_pd(d.sel(sig_type=[st], baseline=b, condition="Park"), name), 
+                    x="f", y=name, color="species", facet_row="sig_group", facet_col="condition", error_y="sem",
+                    hover_data=["n_sigs", "n_subjects", "sem"], 
+                    category_orders=dict(condition=condition_order, sig_group=sig_group_order),
+                    subplot_height=200, subplot_width=400,
+                    )
+      save_fig(fig, name="Power Spectrum Species"+selection, plot_type=name, sig_type=st, baseline=b, cond="Park")
+      fig = filter_facet_categories(line_error_bands)(xr_to_pd(d.sel(sig_type=[st], baseline=b, condition="Park"), name), 
+                    x="f", y=name, color="sig_group", facet_row="species", facet_col="condition", error_y="sem",
+                    hover_data=["n_sigs", "n_subjects", "sem"], 
+                    category_orders=dict(condition=condition_order, sig_group=sig_group_order),
+                    subplot_height=200, subplot_width=400,
+                    )
+      save_fig(fig, name="Power Spectrum Structure"+selection, plot_type=name, sig_type=st, baseline=b, cond="Park")
+      fig = filter_facet_categories(px.line)(xr_to_pd(d.assign(max_f_centered=d["max_f"]-0.5).sel(sig_type=[st, "eeg"], baseline=b), "%_max_f"), 
+                    x="max_f_centered", y="%_max_f", color="species", facet_row="condition", facet_col="sig_group",
+                    line_shape='hv',
+                    hover_data=["max_f", "n_max_f", "n_sigs", "n_subjects"],height=800, 
+                    category_orders=dict(condition=condition_order, sig_group=sig_group_order, species=species_order),
+                    subplot_height=200, subplot_width=400,
+                    )
+      save_fig(fig, name="max_f dist"+selection, plot_type=name, sig_type=st, baseline=b)
+      fig = filter_facet_categories(px.line)(xr_to_pd(d.sel(sig_type=[st, "eeg"], baseline=b), "max_f_"+name), 
+                    x="max_f", y="max_f_"+name, color="species", facet_row="condition", facet_col="sig_group",
+                    hover_data=["max_f", "n_max_f", "n_sigs", "n_subjects"],height=800, 
+                    category_orders=dict(condition=condition_order, sig_group=sig_group_order, species=species_order),
+                    subplot_height=200, subplot_width=400,
+                    )
+      save_fig(fig, name="max_f pow"+selection, plot_type=name, sig_type=st, baseline=b)
 
-for st in welch_grouped["sig_type"].to_numpy():
-  fig = filter_facet_categories(line_error_bands)(xr_to_pd(welch_grouped.sel(sig_type=st), "data"), 
-                x="f", y="data", color="condition", facet_row="sig_group", facet_col="species", error_y="sem",
-                hover_data=["n_sigs", "n_subjects", "sem"], 
-                category_orders=dict(condition=condition_order, sig_group=sig_group_order),
-                subplot_height=200, 
-                )
-  save_fig(fig, name="Power Spectrum", plot_type="welch", sig_type=st)
-  fig = filter_facet_categories(px.line)(xr_to_pd(welch_grouped[["%_max_f", "n_max_f"]].assign(max_f_centered=welch_grouped["max_f"]-0.5).sel(sig_type=st), "%_max_f"), 
-                x="max_f_centered", y="%_max_f", color="species", facet_row="condition", facet_col="sig_group",
-                line_shape='hv',
-                hover_data=["max_f", "n_max_f"],height=800, 
-                category_orders=dict(condition=condition_order, sig_group=sig_group_order, species=species_order),
-                subplot_height=200, 
-                )
-  save_fig(fig, name="#max freq", plot_type="welch", sig_type=st)
+# %%
+for b in coh_grouped["baseline"].to_numpy():
+  for st in coh_grouped["sig_type_1"].to_numpy():
+    fig = filter_facet_categories(line_error_bands)(xr_to_pd(coh_grouped.sel(sig_type_1="eeg", sig_type_2=st, baseline=b), "welch"), 
+                  x="f", y="coh", color="condition", facet_row="sig_group_2", facet_col="species", error_y="sem",
+                  hover_data=["n_sigs", "n_subjects", "sem"], 
+                  category_orders=dict(condition=condition_order, sig_group=sig_group_order),
+                  subplot_height=200, 
+                  )
+    save_fig(fig, name="Power Spectrum", plot_type="welch", sig_type=st, baseline=b)
+    fig = filter_facet_categories(px.line)(xr_to_pd(welch_grouped.assign(max_f_centered=welch_grouped["max_f"]-0.5).sel(sig_type=st, baseline=b), "%_max_f"), 
+                  x="max_f_centered", y="%_max_f", color="species", facet_row="condition", facet_col="sig_group",
+                  line_shape='hv',
+                  hover_data=["max_f", "n_max_f", "n_sigs", "n_subjects"],height=800, 
+                  category_orders=dict(condition=condition_order, sig_group=sig_group_order, species=species_order),
+                  subplot_height=200, 
+                  )
+    save_fig(fig, name="max_f dist", plot_type="welch", sig_type=st, baseline=b)
+    fig = filter_facet_categories(px.line)(xr_to_pd(welch_grouped.sel(sig_type=st, baseline=b), "max_f_welch"), 
+                  x="max_f", y="max_f_welch", color="species", facet_row="condition", facet_col="sig_group",
+                  hover_data=["max_f", "n_max_f", "n_sigs", "n_subjects"],height=800, 
+                  category_orders=dict(condition=condition_order, sig_group=sig_group_order, species=species_order),
+                  subplot_height=200, 
+                  )
+    save_fig(fig, name="max_f pow", plot_type="welch", sig_type=st, baseline=b)
+
+# %%
+raise Exception("stop")
 
 # %%
 
