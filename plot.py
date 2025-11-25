@@ -9,7 +9,7 @@ import itables
 itables.init_notebook_mode(all_interactive=True)
 
 # %%
-def save_fig(fig: go.Figure, name: str, plot_type: str=None, sig_type: str=None, species: str=None, cond: str=None, baseline: str=None):
+def save_fig(fig: go.Figure, name: str, plot_type: str=None, sig_type: str=None, species: str=None, cond: str=None, baseline: str=None, fmethod: str=None):
     path = Path("./results/figures")
     title = []
     if plot_type is not None:
@@ -24,15 +24,18 @@ def save_fig(fig: go.Figure, name: str, plot_type: str=None, sig_type: str=None,
     if species is not None:
        path = path/species.lower()
        title.append(species.capitalize())
+    if fmethod is not None:
+       path = path/fmethod.lower()
+       title.append(fmethod.capitalize())
     if cond is not None:
        path = path/cond.lower()
        title.append(cond.capitalize())
     path = path/(name+".html")
     title = "--".join(title) + "--" + name
     fig.update_layout(title=title)
-    fig.show()
+    fig.show(config=plotly_config)
     path.parent.mkdir(exist_ok=True, parents=True)
-    fig.write_html(path)
+    fig.write_html(path, config=plotly_config)
 
 def save_stats(arr: xr.DataArray, plot_type, subgroup):
     df = arr.to_dataframe(name="pvalue").reset_index()
@@ -60,6 +63,8 @@ species_order = ["Rat", "Monkey", "Human"]
 all_welch =xr.open_dataarray(base_folder/"all_species_welch.zarr").sel(f=slice(3, 55)).compute().to_dataset(name="data")
 all_coh = xr.open_dataarray(base_folder/"all_species_coh.zarr").sel(f=slice(3, 55)).compute().to_dataset(name="coh")
 all_coh["data"] = np.abs(all_coh["coh"])**2
+all_coh["data_angle"] = xr.apply_ufunc(np.angle, all_coh["coh"])
+all_coh = all_coh.drop_vars("coh")
 display(all_welch)
 display(all_coh)
 
@@ -76,7 +81,6 @@ all_welch["channel"] = np.arange(all_welch.sizes["channel"])
 all_coh["channel_pair"] = np.arange(all_coh.sizes["channel_pair"])
 all_welch = assign_grp(all_welch, "")
 all_coh = assign_grp(assign_grp(all_coh, "_1"), "_2")
-
 
 
 welch_groups = ["species", "condition", "sig_group", "sig_type"]
@@ -116,7 +120,21 @@ for d, grps in (all_welch, welch_groups), (all_coh, coh_groups):
     d["auc"] = xr.concat([xr.concat(all, dim=dim).assign_coords(cond_norm="zscored"), auc.assign_coords(cond_norm="none")], dim="cond_norm")
     d["max_f_pow"] = d["data"].sel(f=d["max_f"].fillna(8)).where(d["max_f"])
     
-display(all_welch)
+display(all_coh)
+
+# %%
+
+tmp_coh = all_coh.set_coords([d for d in all_coh.data_vars if not "f" in all_coh[d].dims])
+phase_coh = xr.concat([tmp_coh.sel(f=20).assign_coords(fsel_method="20Hz"), 
+           tmp_coh.sel(f=all_coh["max_f"].fillna(8)).where(all_coh["max_f"].notnull()).assign_coords(fsel_method="maxf")], dim="fsel_method")
+phase_coh["angle_rad"] = xr.DataArray(np.linspace(-np.pi, np.pi, 100, endpoint=False), dims="angle")
+phase_coh["angle"] = phase_coh["angle_rad"] * 180/np.pi
+def angle_diff(a, b):
+    return (a - b + np.pi) % (2 * np.pi) - np.pi
+phase_coh["data"] = phase_coh["data"]*np.exp(-10*(angle_diff(phase_coh["angle_rad"], phase_coh["data_angle"]))**2)
+phase_coh["data"] = phase_coh["data"]/phase_coh["data"].sum("angle")
+phase_coh = phase_coh[["data"]]
+phase_coh
 
 # %%
 
@@ -164,89 +182,128 @@ def compute_groups(d: xr.Dataset, groups: list, name):
     res["sem"] = grp.std() / np.sqrt(res["n_sigs"])
     # res["n_max_f"] = d.groupby(groups+ ["max_f"]).apply(lambda d: xr.DataArray(d.sizes[dim])).fillna(0)
     all = []
-    for b in d["baseline"].to_numpy():
-        all.append(d.sel(baseline=b).groupby(groups+ ["max_f"]).apply(lambda d: xr.DataArray(d.sizes[dim])).fillna(0))
-    res["n_max_f"] = xr.concat(all, dim="baseline")
-    res["n_max_f"] = res["n_max_f"].where(res["n_max_f"].sum("max_f")>0)
-    res["%_max_f"] = res["n_max_f"]/res["n_max_f"].sum("max_f")
-    res["max_f_"+name] = d.set_coords("max_f")["max_f_pow"].groupby(groups+ ["max_f"]).mean()
+    if "f" in d["data"].dims:
+      for b in d["baseline"].to_numpy():
+          all.append(d.sel(baseline=b).groupby(groups+ ["max_f"]).apply(lambda d: xr.DataArray(d.sizes[dim])).fillna(0))
+      res["n_max_f"] = xr.concat(all, dim="baseline")
+      res["n_max_f"] = res["n_max_f"].where(res["n_max_f"].sum("max_f")>0)
+      res["%_max_f"] = res["n_max_f"]/res["n_max_f"].sum("max_f")
+      res["max_f_"+name] = d.set_coords("max_f")["max_f_pow"].groupby(groups+ ["max_f"]).mean()
     return res
 
 welch_grouped = compute_groups(all_welch, welch_groups, "welch")
 coh_grouped = compute_groups(all_coh, coh_groups, "coh")
+phase_coh_grouped = compute_groups(phase_coh, coh_groups, "coh_phase")
 display(welch_grouped)
 display(coh_grouped)
+display(phase_coh_grouped)
 
 # %%
 d_coh = coh_grouped.sel(sig_type_1="eeg").rename(sig_group_2="sig_group", sig_type_2="sig_type")
-for name, d in ("coh", d_coh), ("welch", welch_grouped):
+d_phase = phase_coh_grouped.sel(sig_type_1="eeg").rename(sig_group_2="sig_group", sig_type_2="sig_type")
+
+def plot(data, name, **kwargs):
+  func = line_error_bands if "error_y" in kwargs else px.line
+  data_df = xr_to_pd(data, name)
+  return filter_facet_categories(func)(data_df, **kwargs,
+                    hover_data=[c for c in ["n_sigs", "n_subjects", "sem"] if c in data_df.columns], 
+                    category_orders=dict(condition=condition_order, sig_group=sig_group_order, species=species_order),
+                    subplot_height=200, subplot_width=400,
+  )
+
+
+for name, d in ("coh", d_coh), ("welch", welch_grouped), ("coh_phase", d_phase):
   for b in d["baseline"].to_numpy():
     for st in d["sig_type"].to_numpy():
       if st=="eeg":
         continue
       selection = "" if name=="welch" else " rel EEG"
-      fig = filter_facet_categories(line_error_bands)(xr_to_pd(d.sel(sig_type=[st], baseline=b), name), 
-                    x="f", y=name, color="condition", facet_row="sig_group", facet_col="species", error_y="sem",
-                    hover_data=["n_sigs", "n_subjects", "sem"], 
-                    category_orders=dict(condition=condition_order, sig_group=sig_group_order),
-                    subplot_height=200, subplot_width=400,
-                    )
-      save_fig(fig, name="Power Spectrum"+selection, plot_type=name, sig_type=st, baseline=b)
-      fig = filter_facet_categories(line_error_bands)(xr_to_pd(d.sel(sig_type=[st], baseline=b, condition="Park"), name), 
-                    x="f", y=name, color="species", facet_row="sig_group", facet_col="condition", error_y="sem",
-                    hover_data=["n_sigs", "n_subjects", "sem"], 
-                    category_orders=dict(condition=condition_order, sig_group=sig_group_order),
-                    subplot_height=200, subplot_width=400,
-                    )
-      save_fig(fig, name="Power Spectrum Species"+selection, plot_type=name, sig_type=st, baseline=b, cond="Park")
-      fig = filter_facet_categories(line_error_bands)(xr_to_pd(d.sel(sig_type=[st], baseline=b, condition="Park"), name), 
-                    x="f", y=name, color="sig_group", facet_row="species", facet_col="condition", error_y="sem",
-                    hover_data=["n_sigs", "n_subjects", "sem"], 
-                    category_orders=dict(condition=condition_order, sig_group=sig_group_order),
-                    subplot_height=200, subplot_width=400,
-                    )
-      save_fig(fig, name="Power Spectrum Structure"+selection, plot_type=name, sig_type=st, baseline=b, cond="Park")
-      fig = filter_facet_categories(px.line)(xr_to_pd(d.assign(max_f_centered=d["max_f"]-0.5).sel(sig_type=[st, "eeg"], baseline=b), "%_max_f"), 
-                    x="max_f_centered", y="%_max_f", color="species", facet_row="condition", facet_col="sig_group",
-                    line_shape='hv',
-                    hover_data=["max_f", "n_max_f", "n_sigs", "n_subjects"],height=800, 
-                    category_orders=dict(condition=condition_order, sig_group=sig_group_order, species=species_order),
-                    subplot_height=200, subplot_width=400,
-                    )
-      save_fig(fig, name="max_f dist"+selection, plot_type=name, sig_type=st, baseline=b)
-      fig = filter_facet_categories(px.line)(xr_to_pd(d.sel(sig_type=[st, "eeg"], baseline=b), "max_f_"+name), 
-                    x="max_f", y="max_f_"+name, color="species", facet_row="condition", facet_col="sig_group",
-                    hover_data=["max_f", "n_max_f", "n_sigs", "n_subjects"],height=800, 
-                    category_orders=dict(condition=condition_order, sig_group=sig_group_order, species=species_order),
-                    subplot_height=200, subplot_width=400,
-                    )
-      save_fig(fig, name="max_f pow"+selection, plot_type=name, sig_type=st, baseline=b)
+      ytype = "Power Spectrum" if not "phase" in name else "Phase Proba"
+      x_col = "f" if not "phase" in name else "angle"
+      fmethod = [None] if not "phase" in name else d["fsel_method"].to_numpy()
+      for fsel in fmethod:
+        plot_d = d.sel(sig_type=[st], baseline=b) if fsel is None else d.sel(sig_type=[st], baseline=b, fsel_method=fsel)
+
+        fig = plot(plot_d, name, x=x_col, y=name, color="condition", facet_row="sig_group", facet_col="species", error_y="sem")
+        save_fig(fig, name=f"{ytype} Condition"+selection, plot_type=name, sig_type=st, baseline=b, fmethod=fsel)
+
+        fig = plot(plot_d.sel(condition="Park"), name, 
+                  x=x_col, y=name, color="species", facet_row="sig_group", facet_col="condition", error_y="sem")
+        save_fig(fig, name=f"{ytype} Species"+selection, plot_type=name, sig_type=st, baseline=b, cond="Park", fmethod=fsel)
+
+        fig = plot(plot_d.sel(condition="Park"), name, 
+                  x=x_col, y=name, color="sig_group", facet_row="species", facet_col="condition", error_y="sem")
+        save_fig(fig, name=f"{ytype} Structure"+selection, plot_type=name, sig_type=st, baseline=b, cond="Park", fmethod=fsel)
+
+      if "f" in d.dims:
+        fig = plot(d.assign(max_f_centered=d["max_f"]-0.5).sel(sig_type=[st, "eeg"], baseline=b), "%_max_f", 
+                  x="max_f_centered", y="%_max_f", color="species", facet_row="condition", facet_col="sig_group",
+                  line_shape='hv',)
+        save_fig(fig, name="max_f dist"+selection, plot_type=name, sig_type=st, baseline=b)
+
+        fig = plot(d.sel(sig_type=[st, "eeg"], baseline=b), "max_f_"+name, 
+                      x="max_f", y="max_f_"+name, color="species", facet_row="condition", facet_col="sig_group")
+        save_fig(fig, name="max_f pow"+selection, plot_type=name, sig_type=st, baseline=b)
 
 # %%
-for b in coh_grouped["baseline"].to_numpy():
-  for st in coh_grouped["sig_type_1"].to_numpy():
-    fig = filter_facet_categories(line_error_bands)(xr_to_pd(coh_grouped.sel(sig_type_1="eeg", sig_type_2=st, baseline=b), "welch"), 
-                  x="f", y="coh", color="condition", facet_row="sig_group_2", facet_col="species", error_y="sem",
-                  hover_data=["n_sigs", "n_subjects", "sem"], 
-                  category_orders=dict(condition=condition_order, sig_group=sig_group_order),
-                  subplot_height=200, 
-                  )
-    save_fig(fig, name="Power Spectrum", plot_type="welch", sig_type=st, baseline=b)
-    fig = filter_facet_categories(px.line)(xr_to_pd(welch_grouped.assign(max_f_centered=welch_grouped["max_f"]-0.5).sel(sig_type=st, baseline=b), "%_max_f"), 
-                  x="max_f_centered", y="%_max_f", color="species", facet_row="condition", facet_col="sig_group",
-                  line_shape='hv',
-                  hover_data=["max_f", "n_max_f", "n_sigs", "n_subjects"],height=800, 
-                  category_orders=dict(condition=condition_order, sig_group=sig_group_order, species=species_order),
-                  subplot_height=200, 
-                  )
-    save_fig(fig, name="max_f dist", plot_type="welch", sig_type=st, baseline=b)
-    fig = filter_facet_categories(px.line)(xr_to_pd(welch_grouped.sel(sig_type=st, baseline=b), "max_f_welch"), 
-                  x="max_f", y="max_f_welch", color="species", facet_row="condition", facet_col="sig_group",
-                  hover_data=["max_f", "n_max_f", "n_sigs", "n_subjects"],height=800, 
-                  category_orders=dict(condition=condition_order, sig_group=sig_group_order, species=species_order),
-                  subplot_height=200, 
-                  )
-    save_fig(fig, name="max_f pow", plot_type="welch", sig_type=st, baseline=b)
+raise Exception("Stop")
+
+# %%
+tmp_coh = all_coh.set_coords([d for d in all_coh.data_vars if not "f" in all_coh[d].dims])
+phase_coh = xr.concat([tmp_coh.sel(f=20).assign_coords(fsel_method="20Hz"), 
+           tmp_coh.sel(f=all_coh["max_f"].fillna(8)).where(all_coh["max_f"].notnull()).assign_coords(fsel_method="maxf")], dim="fsel_method")
+phase_coh["angle_rad"] = xr.DataArray(np.linspace(-np.pi, np.pi, 100, endpoint=False), dims="angle")
+phase_coh["angle"] = phase_coh["angle_rad"] * 180/np.pi
+def angle_diff(a, b):
+    return (a - b + np.pi) % (2 * np.pi) - np.pi
+phase_coh["data"] = phase_coh["data"]*np.exp(-10*(angle_diff(phase_coh["angle_rad"], phase_coh["data_angle"]))**2)
+phase_coh = phase_coh[["data"]]
+
+# %%
+
+display(grouped_phase_coh)
+d = grouped_phase_coh.sel(sig_type_1="eeg").rename(sig_group_2="sig_group", sig_type_2="sig_type")
+for fmethod in d["fsel_method"].to_numpy():
+  for b in d["baseline"].to_numpy():
+      for st in d["sig_type"].to_numpy():
+        if st=="eeg":
+          continue
+        fig = filter_facet_categories(px.line)(xr_to_pd(d.sel(sig_type=[st], baseline=b, fsel_method=fmethod), "angle_contrib"), 
+                      x="angle", y="angle_contrib", color="condition", facet_row="sig_group", facet_col="species", 
+                      hover_data=[], 
+                      category_orders=dict(condition=condition_order, sig_group=sig_group_order),
+                      subplot_height=200, subplot_width=400,
+        )
+        fig.show()
+
+# %%
+
+
+# %%
+# for b in coh_grouped["baseline"].to_numpy():
+#   for st in coh_grouped["sig_type_1"].to_numpy():
+#     fig = filter_facet_categories(line_error_bands)(xr_to_pd(coh_grouped.sel(sig_type_1="eeg", sig_type_2=st, baseline=b), "welch"), 
+#                   x="f", y="coh", color="condition", facet_row="sig_group_2", facet_col="species", error_y="sem",
+#                   hover_data=["n_sigs", "n_subjects", "sem"], 
+#                   category_orders=dict(condition=condition_order, sig_group=sig_group_order),
+#                   subplot_height=200, 
+#                   )
+#     save_fig(fig, name="Power Spectrum", plot_type="welch", sig_type=st, baseline=b)
+#     fig = filter_facet_categories(px.line)(xr_to_pd(welch_grouped.assign(max_f_centered=welch_grouped["max_f"]-0.5).sel(sig_type=st, baseline=b), "%_max_f"), 
+#                   x="max_f_centered", y="%_max_f", color="species", facet_row="condition", facet_col="sig_group",
+#                   line_shape='hv',
+#                   hover_data=["max_f", "n_max_f", "n_sigs", "n_subjects"],height=800, 
+#                   category_orders=dict(condition=condition_order, sig_group=sig_group_order, species=species_order),
+#                   subplot_height=200, 
+#                   )
+#     save_fig(fig, name="max_f dist", plot_type="welch", sig_type=st, baseline=b)
+#     fig = filter_facet_categories(px.line)(xr_to_pd(welch_grouped.sel(sig_type=st, baseline=b), "max_f_welch"), 
+#                   x="max_f", y="max_f_welch", color="species", facet_row="condition", facet_col="sig_group",
+#                   hover_data=["max_f", "n_max_f", "n_sigs", "n_subjects"],height=800, 
+#                   category_orders=dict(condition=condition_order, sig_group=sig_group_order, species=species_order),
+#                   subplot_height=200, 
+#                   )
+#     save_fig(fig, name="max_f pow", plot_type="welch", sig_type=st, baseline=b)
 
 # %%
 raise Exception("stop")
