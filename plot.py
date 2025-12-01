@@ -216,11 +216,17 @@ def compute_groups(d: xr.Dataset, groups: list, name):
     all = []
     if "f" in d["data"].dims:
       for b in d["baseline"].to_numpy():
-          all.append(d.sel(baseline=b).groupby(groups+ ["max_f"]).apply(lambda d: xr.DataArray(d.sizes[dim])).fillna(0))
-      res["n_max_f"] = xr.concat(all, dim="baseline")
-      res["n_max_f"] = res["n_max_f"].where(res["n_max_f"].sum("max_f")>0)
-      res["%_max_f"] = res["n_max_f"]/res["n_max_f"].sum("max_f")
-      res["max_f_"+name] = d.set_coords("max_f")["max_f_pow"].groupby(groups+ ["max_f"]).mean()
+          tmp = []
+          for fm in d["fmethod"].to_numpy():
+            if fm=="mean":
+               continue
+            tmp.append(d.sel(baseline=b, fmethod=fm).groupby(groups+ ["f_sel"]).apply(lambda d: d["f_sel"].count()).fillna(0))
+          all.append(xr.concat(tmp, dim="fmethod"))
+      all = xr.concat(all, dim="baseline")
+      res["n_f_sel"] = all
+      res["n_f_sel"] = res["n_f_sel"].where(res["n_f_sel"].sum("f_sel")>0)
+      res["%_f_sel"] = res["n_f_sel"]/res["n_f_sel"].sum("f_sel")
+      # res["f_sel_"+name] = d.set_coords("f_sel")["max_f_pow"].groupby(groups+ ["max_f"]).mean()
     return res
 
 welch_grouped = compute_groups(all_welch, welch_groups, "welch")
@@ -238,7 +244,7 @@ def plot(data, name, **kwargs):
   func = line_error_bands if "error_y" in kwargs else px.line
   data_df = xr_to_pd(data, name)
   return filter_facet_categories(func)(data_df, **kwargs,
-                    hover_data=[c for c in ["n_sigs", "n_subjects", "sem"] if c in data_df.columns], 
+                    hover_data=[c for c in ["n_sigs", "n_subjects", "sem", "n_f_sel"] if c in data_df.columns], 
                     category_orders=dict(condition=condition_order, sig_group=sig_group_order, species=species_order),
                     subplot_height=200, subplot_width=400,
   )
@@ -252,9 +258,9 @@ for name, d in ("coh", d_coh), ("welch", welch_grouped), ("coh_phase", d_phase):
       selection = "" if name=="welch" else " rel EEG"
       ytype = "Power Spectrum" if not "phase" in name else "Phase Proba"
       x_col = "f" if not "phase" in name else "angle"
-      fmethod = [None] if not "phase" in name else d["fsel_method"].to_numpy()
+      fmethod = [None] if not "phase" in name else d["fmethod"].to_numpy()
       for fsel in fmethod:
-        plot_d = d.sel(sig_type=[st], baseline=b) if fsel is None else d.sel(sig_type=[st], baseline=b, fsel_method=fsel)
+        plot_d = d.sel(sig_type=[st], baseline=b) if fsel is None else d.sel(sig_type=[st], baseline=b, fmethod=fsel)
 
         fig = plot(plot_d, name, x=x_col, y=name, color="condition", facet_row="sig_group", facet_col="species", error_y="sem")
         save_fig(fig, name=f"{ytype} Condition"+selection, plot_type=name, sig_type=st, baseline=b, fmethod=fsel)
@@ -268,13 +274,17 @@ for name, d in ("coh", d_coh), ("welch", welch_grouped), ("coh_phase", d_phase):
         save_fig(fig, name=f"{ytype} Structure"+selection, plot_type=name, sig_type=st, baseline=b, cond="Park", fmethod=fsel)
 
       if "f" in d.dims:
-        fig = plot(d.assign(max_f_centered=d["max_f"]-0.5).sel(sig_type=[st, "eeg"], baseline=b), "%_max_f", 
-                  x="max_f_centered", y="%_max_f", color="species", facet_row="condition", facet_col="sig_group",
-                  line_shape='hv',)
-        save_fig(fig, name="max_f dist"+selection, plot_type=name, sig_type=st, baseline=b)
+        for fsel in d["fmethod"].to_numpy():
+          if fsel in ["mean", "20Hz"]:
+            continue
+          plot_d = d.sel(sig_type=[st], baseline=b, fmethod=fsel)
+          fig = plot(plot_d.assign(max_f_centered=plot_d["f_sel"]-0.5), "%_f_sel", 
+                    x="max_f_centered", y="%_f_sel", color="species", facet_row="condition", facet_col="sig_group",
+                    line_shape='hv',)
+          save_fig(fig, name="max_f dist"+selection, plot_type=name, sig_type=st, baseline=b, fmethod=fsel)
 
-        fig = plot(d.sel(sig_type=[st, "eeg"], baseline=b), "max_f_"+name, 
-                      x="max_f", y="max_f_"+name, color="species", facet_row="condition", facet_col="sig_group")
-        save_fig(fig, name="max_f pow"+selection, plot_type=name, sig_type=st, baseline=b)
+        # fig = plot(d.sel(sig_type=[st, "eeg"], baseline=b), "max_f_"+name, 
+        #               x="max_f", y="max_f_"+name, color="species", facet_row="condition", facet_col="sig_group")
+        # save_fig(fig, name="max_f pow"+selection, plot_type=name, sig_type=st, baseline=b)
 
 
