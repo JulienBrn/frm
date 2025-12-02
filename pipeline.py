@@ -155,6 +155,17 @@ async def process_rat_session(session_ds: xr.Dataset, session_index):
             ffts =  (await checkpoint_xarray(lambda: compute_ffts(initial_sigs()), f"fft/{session_str}.zarr", "fft", session_index))
             pwelch = (await checkpoint_xarray(lambda: compute_pwelch(ffts()), f"pwelch/{session_str}.zarr", "pwelch", session_index))
             coh = (await checkpoint_xarray(lambda: compute_coh(ffts(), all_chans), f"coh/{session_str}.zarr", "coh", session_index))
+            def compute_n_spikes(sig_type, spike2file, chan, delta_t, common_duration):
+                if sig_type != "units":
+                    return np.nan
+                with sonfile(spike2_file) as rec:
+                    time_base = rec.GetTimeBase()
+                    data = np.array(rec.ReadEvents(chan, 10**7, int(delta_t/time_base), int((delta_t+common_duration)/time_base)))*time_base
+                    return data.size/common_duration
+            
+            all_chans["neuron_fr"] = all_chans.apply(lambda row: compute_n_spikes(row["signal_type"], spike2_file, row["chan_num"], row["delta_t"], row["common_duration"]), axis=1)
+            all_chans["neuron_str_type"] = np.where((all_chans["structure"]=="STR") & (all_chans["signal_type"] =="units") & all_chans["neuron_fr"].notna(),
+                                                    np.where(all_chans["neuron_fr"] < 2, "STR<2Hz", "STR>2Hz"), "")
             return pwelch, coh, all_chans
         except ErrorReport.ReportedError as e:
             return None
@@ -319,6 +330,7 @@ async def process_rats_data():
     channel_metadata = xr_merge(channel_metadata, neuron_types, how="left", on=["session_grp", "subject", "chan_name_normalized"])
     channel_metadata["has_swa"] = channel_metadata["has_swa"].astype(bool)
     channel_metadata["neuron_type"] = channel_metadata["neuron_type"].fillna("").astype(str)
+    channel_metadata["neuron_type"] = xr.where(channel_metadata["neuron_str_type"] != "", channel_metadata["neuron_str_type"], channel_metadata["neuron_type"])
     channel_df = channel_metadata.to_dataframe().reset_index(drop=True)
     channel_df.astype({col: "int" for col in channel_df.select_dtypes("bool").columns}).to_excel(base_result_path/"rat_metadata.xlsx", index=False)
     # print(channel_df.columns)
@@ -708,6 +720,14 @@ async def process_human_data():
 async def main():
     from pipeline_helper import _save_xarray
     rat_welch, rat_coh = await process_rats_data()
+    # rat_welch["neuron_type"] = xr.where((rat_welch["structure"] == "STR") & (rat_welch["sig_type"] == "neuron")  & (rat_welch["neuron_fr"].notnull()), 
+    #                                     xr.where(rat_welch["neuron_fr"] < 2, "STR<2Hz", "STR>2Hz")
+    #                                     ,rat_welch["neuron_type"])
+    
+    # for suffix in "_1", "_2":
+    #     rat_coh["neuron_type"+suffix] = xr.where((rat_welch["structure"+suffix] == "STR") & (rat_welch["sig_type"] == "neuron")  & (rat_welch["neuron_fr"].notnull()), 
+    #                                         xr.where(rat_welch["neuron_fr"] < 2, "STR<2Hz", "STR>2Hz")
+    #                                         ,rat_welch["neuron_type"])
     # _save_xarray(rat_welch, base_result_path/"rat_welch.zarr")
     # _save_xarray(rat_coh, base_result_path/"rat_coh.zarr")
     monkey_welch = await process_monkey_data()

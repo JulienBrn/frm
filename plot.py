@@ -57,7 +57,7 @@ def xr_to_pd(ds:xr.Dataset, col):
 base_folder = Path("/media/julienb/T7 Shield/Revue-FRM/AnalysisData8/")
 
 # %%
-sig_group_order = ["eeg", "STR", "STN", "GPe", "Arky", "Proto"]
+sig_group_order = ["eeg", "STR", "STN", "GPe", "Arky", "Proto", "STR<2Hz", "STR>2Hz"]
 condition_order = ["Park", "CTL"]
 species_order = ["Rat", "Monkey", "Human"]
 
