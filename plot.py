@@ -106,7 +106,21 @@ for d, grps in (all_welch, welch_groups), (all_coh, coh_groups):
     dim =d["condition"].dims[0]
     max_f = d["data"].sel(f=slice(8, 35)).idxmax("f")
     pic_f = max_f.where((d["data"].sel(f=max_f) > d["data"].sel(f=max_f+1)) & (d["data"].sel(f=max_f) > d["data"].sel(f=max_f-1)))
-    f_sel = xr.concat([max_f.assign_coords(fmethod="max"), pic_f.assign_coords(fmethod="pic"), xr.full_like(max_f, 20).assign_coords(fmethod="20Hz")], dim="fmethod")
+    def max_of_grp(g: xr.DataArray):
+       res = (g.sel(f=slice(8, 35)).sel({dim: g["condition"] == "Park"}).mean(dim) -  g.sel(f=slice(8, 35)).sel({dim: g["condition"] == "CTL"}).mean(dim)).idxmax("f")
+       b = res.broadcast_like(g[dim])
+       b = b.rename("best_f")
+       return b
+    all = []
+    for _, grp in d["data"].groupby([c for c in grps if not c=="condition"]):
+       all.append(max_of_grp(grp))
+    d["max_f_grp"] = xr.concat(all, dim=dim)
+    
+    f_sel = xr.concat([max_f.assign_coords(fmethod="max"), 
+                       pic_f.assign_coords(fmethod="pic"), 
+                       xr.full_like(max_f, 20).assign_coords(fmethod="20Hz"), 
+                       d["max_f_grp"].assign_coords(fmethod="max_f_grp")],
+                       dim="fmethod")
     pow_at_f_sel = d["data"].sel(f=f_sel.fillna(8)).where(f_sel.notnull())
     # d["max_f"] = max_f
     auc = d["data"].sel(f=slice(8,35), drop=True).mean("f")
